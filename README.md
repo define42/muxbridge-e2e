@@ -41,6 +41,9 @@ listen_https: ":443"
 listen_http: ":80"
 data_dir: "/var/lib/muxbridge-e2e-edge"
 
+# Optional. Contact email for edge-managed ACME on edge_domain.
+acme_email: "ops@example.com"
+
 # Optional. Omit both to use CertMagic (ACME TLS-ALPN-01) for edge_domain only.
 tls_cert_file: "/etc/muxbridge-e2e/edge.crt"
 tls_key_file: "/etc/muxbridge-e2e/edge.key"
@@ -58,6 +61,7 @@ client_credentials:
 ```
 
 A hostname may appear under only one token. A client's registered hostnames must exactly equal the hostnames listed for its token (same set, order-independent).
+When the edge manages its own certificate via CertMagic, `acme_email` becomes the ACME account contact for `edge_domain`.
 
 ### Client
 
@@ -94,7 +98,7 @@ Direct invocation:
 ./bin/client -config examples/client.yaml
 ```
 
-A real deployment also needs: DNS for `edge_domain` and every tunneled hostname pointing at the public `edge`, public reachability on `:80` and `:443`, and a writable `data_dir` on the `client` for CertMagic state.
+A real deployment also needs: DNS for `edge_domain` and every tunneled hostname pointing at the public `edge`, public reachability on `:80` and `:443`, a writable `data_dir` on the `client` for CertMagic state, and a writable `data_dir` on the `edge` too if it manages `edge_domain` via CertMagic.
 
 ## Client Library
 

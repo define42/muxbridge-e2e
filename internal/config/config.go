@@ -45,6 +45,7 @@ type EdgeConfig struct {
 	ListenHTTPS        string              `yaml:"listen_https"`
 	ListenHTTP         string              `yaml:"listen_http"`
 	DataDir            string              `yaml:"data_dir"`
+	AcmeEmail          string              `yaml:"acme_email"`
 	TLSCertFile        string              `yaml:"tls_cert_file"`
 	TLSKeyFile         string              `yaml:"tls_key_file"`
 	ClientCredentials  map[string][]string `yaml:"client_credentials"`

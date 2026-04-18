@@ -566,7 +566,7 @@ func (s *Service) buildTLSConfig() (*tls.Config, *certmagic.Config, error) {
 	storageDir := fmt.Sprintf("%s/edge-certmagic", s.cfg.DataDir)
 	manager := newCertManager(storageDir, s.certIssuerFactory, func(cm *certmagic.Config) certmagic.Issuer {
 		return certmagic.NewACMEIssuer(cm, certmagic.ACMEIssuer{
-			Email:                   "",
+			Email:                   s.cfg.AcmeEmail,
 			Agreed:                  true,
 			DisableHTTPChallenge:    true,
 			DisableTLSALPNChallenge: false,

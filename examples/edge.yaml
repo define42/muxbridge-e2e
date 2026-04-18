@@ -4,7 +4,10 @@ listen_https: ":443"
 listen_http: ":80"
 data_dir: "/var/lib/muxbridge-e2e-edge"
 
-# Omit these to let the edge use CertMagic for edge_domain only.
+# Optional. Contact email for edge-managed ACME on edge_domain.
+acme_email: "ops@example.com"
+
+# Optional. Omit both to let the edge use CertMagic for edge_domain only.
 tls_cert_file: "/etc/muxbridge-e2e/edge.crt"
 tls_key_file: "/etc/muxbridge-e2e/edge.key"
 
