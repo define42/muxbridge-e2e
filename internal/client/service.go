@@ -182,13 +182,17 @@ func (s *Service) connectOnce(ctx context.Context) error {
 		_ = tlsConn.Close()
 		return fmt.Errorf("create yamux client: %w", err)
 	}
-	defer session.Close()
+	defer func() {
+		_ = session.Close()
+	}()
 
 	controlStream, err := session.OpenStream()
 	if err != nil {
 		return fmt.Errorf("open control stream: %w", err)
 	}
-	defer controlStream.Close()
+	defer func() {
+		_ = controlStream.Close()
+	}()
 
 	controlWriter := control.NewLockedWriter(controlStream)
 	if err := controlWriter.WriteEnvelope(&controlpb.Envelope{

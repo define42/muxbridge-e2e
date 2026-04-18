@@ -118,7 +118,7 @@ func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer closeChecked(t, resp.Body)
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return err
@@ -138,7 +138,7 @@ func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /headers error = %v", err)
 		}
-		defer resp.Body.Close()
+		defer closeChecked(t, resp.Body)
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatalf("ReadAll() error = %v", err)
@@ -187,7 +187,7 @@ func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /healthz error = %v", err)
 		}
-		defer resp.Body.Close()
+		defer closeChecked(t, resp.Body)
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatalf("ReadAll() error = %v", err)
@@ -209,7 +209,7 @@ func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Dial() error = %v", err)
 		}
-		defer conn.Close()
+		defer closeChecked(t, conn)
 	})
 
 	t.Run("StreamingResponse", func(t *testing.T) {
@@ -217,7 +217,7 @@ func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /stream error = %v", err)
 		}
-		defer resp.Body.Close()
+		defer closeChecked(t, resp.Body)
 
 		reader := bufio.NewReader(resp.Body)
 		start := time.Now()
@@ -254,7 +254,7 @@ func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /slow error = %v", err)
 		}
-		defer resp.Body.Close()
+		defer closeChecked(t, resp.Body)
 
 		reader := bufio.NewReader(resp.Body)
 		first, err := reader.ReadString('\n')
@@ -299,7 +299,7 @@ func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			defer resp.Body.Close()
+			defer closeChecked(t, resp.Body)
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				return err
@@ -361,7 +361,7 @@ func TestEdgeCertMagicMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /healthz error = %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeChecked(t, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -459,7 +459,7 @@ func TestACMETLSALPNPassthrough(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer closeChecked(t, resp.Body)
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return err
@@ -526,7 +526,9 @@ func newUpstreamServer(t *testing.T, label string) *httptest.Server {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 		for {
 			messageType, payload, err := conn.ReadMessage()
 			if err != nil {
@@ -561,7 +563,9 @@ func tlsHandshake(actualAddr, serverName string, nextProtos []string) (tls.Conne
 	if err != nil {
 		return tls.ConnectionState{}, err
 	}
-	defer rawConn.Close()
+	defer func() {
+		_ = rawConn.Close()
+	}()
 
 	cfg := &tls.Config{
 		InsecureSkipVerify: true,
@@ -573,7 +577,9 @@ func tlsHandshake(actualAddr, serverName string, nextProtos []string) (tls.Conne
 	if err := conn.Handshake(); err != nil {
 		return tls.ConnectionState{}, err
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 	return conn.ConnectionState(), nil
 }
 
@@ -617,6 +623,13 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func closeChecked(t *testing.T, closer io.Closer) {
+	t.Helper()
+	if err := closer.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
 }
 
 func writeServerCert(t *testing.T, dir string, host string) (string, string) {

@@ -40,8 +40,12 @@ func TestParseClientHelloRecordsFragmented(t *testing.T) {
 
 func TestPeekClientHelloReplay(t *testing.T) {
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer func() {
+		_ = server.Close()
+	}()
+	defer func() {
+		_ = client.Close()
+	}()
 
 	records := buildClientHelloRecords(t, "demo.example.com", []string{"h2"}, true)
 	extra := []byte("payload-after-clienthello")

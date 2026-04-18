@@ -70,31 +70,21 @@ func buildProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProxy {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = transport
-	proxy.FlushInterval = -1
-	proxy.Director = func(req *http.Request) {
-		originalHost := req.Host
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.URL.Path, req.URL.RawPath = joinURLPath(target, req.URL)
-		if target.RawQuery == "" || req.URL.RawQuery == "" {
-			req.URL.RawQuery = target.RawQuery + req.URL.RawQuery
-		} else {
-			req.URL.RawQuery = target.RawQuery + "&" + req.URL.RawQuery
-		}
-		req.Host = originalHost
-		req.Header.Set("X-Forwarded-Proto", "https")
-		req.Header.Set("X-Forwarded-Host", originalHost)
-		if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
-			appendXForwardedFor(req.Header, clientIP)
-		}
+	return &httputil.ReverseProxy{
+		Transport:     transport,
+		FlushInterval: -1,
+		Rewrite: func(req *httputil.ProxyRequest) {
+			req.SetURL(target)
+			req.Out.Host = req.In.Host
+			req.SetXForwarded()
+			req.Out.Header.Set("X-Forwarded-Proto", "https")
+			req.Out.Header.Set("X-Forwarded-Host", req.In.Host)
+		},
+		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
+			logger.Error("proxy error", "host", canonicalHost(req.Host), "error", err)
+			http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		},
 	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
-		logger.Error("proxy error", "host", canonicalHost(req.Host), "error", err)
-		http.Error(w, "upstream unavailable", http.StatusBadGateway)
-	}
-	return proxy
 }
 
 func (r *Router) serveWebSocket(w http.ResponseWriter, req *http.Request, target *url.URL) {
@@ -138,7 +128,9 @@ func (r *Router) serveWebSocket(w http.ResponseWriter, req *http.Request, target
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		return
 	}
-	defer upstreamConn.Close()
+	defer func() {
+		_ = upstreamConn.Close()
+	}()
 
 	responseHeader := http.Header{}
 	if subprotocol := upstreamConn.Subprotocol(); subprotocol != "" {
@@ -157,7 +149,9 @@ func (r *Router) serveWebSocket(w http.ResponseWriter, req *http.Request, target
 	if err != nil {
 		return
 	}
-	defer clientConn.Close()
+	defer func() {
+		_ = clientConn.Close()
+	}()
 	_ = clientConn.SetReadDeadline(time.Time{})
 	_ = clientConn.SetWriteDeadline(time.Time{})
 	_ = upstreamConn.SetReadDeadline(time.Time{})

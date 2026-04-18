@@ -417,8 +417,8 @@ func (s *Service) handleControlConn(ctx context.Context, conn net.Conn) {
 				Accepted:               true,
 				Message:                "registered",
 				Hostnames:              hostnames,
-				HeartbeatIntervalNanos: s.cfg.HeartbeatInterval.Duration.Nanoseconds(),
-				HeartbeatTimeoutNanos:  s.cfg.HeartbeatTimeout.Duration.Nanoseconds(),
+				HeartbeatIntervalNanos: s.cfg.HeartbeatInterval.Nanoseconds(),
+				HeartbeatTimeoutNanos:  s.cfg.HeartbeatTimeout.Nanoseconds(),
 			},
 		},
 	}); err != nil {
