@@ -168,6 +168,64 @@ docker build --target client -t muxbridge-e2e-client .
 
 The edge image exposes `80` and `443`. Example configs are copied to `/etc/muxbridge-e2e/`.
 
+Example `docker-compose.yml`:
+
+```yaml
+services:
+  edge:
+    build:
+      context: .
+      target: edge
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./examples/edge.yaml:/etc/muxbridge-e2e/edge.yaml:ro
+      - edge-data:/var/lib/muxbridge-e2e-edge
+    networks:
+      muxbridge:
+        aliases:
+          - edge.example.com
+
+  client:
+    build:
+      context: .
+      target: client
+    restart: unless-stopped
+    depends_on:
+      - edge
+      - demo
+      - api
+    volumes:
+      - ./examples/client.yaml:/etc/muxbridge-e2e/client.yaml:ro
+      - client-data:/var/lib/muxbridge-e2e-client
+    networks:
+      - muxbridge
+
+  demo:
+    image: hashicorp/http-echo:1.0.0
+    command: ["-listen", ":8080", "-text", "demo ok"]
+    networks:
+      - muxbridge
+
+  api:
+    image: hashicorp/http-echo:1.0.0
+    command: ["-listen", ":9000", "-text", "api ok"]
+    networks:
+      - muxbridge
+
+volumes:
+  edge-data:
+  client-data:
+
+networks:
+  muxbridge:
+    driver: bridge
+```
+
+For Compose, point the client routes at service names instead of `127.0.0.1`, for example `demo.example.com: "http://demo:8080"` and `api.demo.example.com: "http://api:9000"`. Keeping `edge_addr: "edge.example.com:443"` works here because the `edge` service advertises `edge.example.com` as a network alias.
+
 ## Runtime Behavior
 
 ### Port 443
