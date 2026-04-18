@@ -112,7 +112,7 @@ func TestTunnelHandlerE2E(t *testing.T) {
 	// This is the user-supplied handler — exactly like the README example.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintln(w, "hello world")
+		_, _ = fmt.Fprintln(w, "hello world")
 	})
 
 	// tunnel.New doesn't expose DialContext or CertIssuerFactory (by design:
@@ -158,7 +158,7 @@ func TestTunnelHandlerE2E(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		body, _ := io.ReadAll(resp.Body)
 		if got := strings.TrimSpace(string(body)); got != "hello world" {
 			return fmt.Errorf("body = %q, want %q", got, "hello world")
