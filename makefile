@@ -57,6 +57,7 @@ run-edge:
 run-client:
 	go run ./cmd/client -config $(CLIENT_CONFIG)
 
+
 help:
 	@printf '%s\n' \
 		'Available targets:' \
