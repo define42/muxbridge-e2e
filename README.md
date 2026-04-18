@@ -55,13 +55,14 @@ This is not an HTTP-over-RPC tunnel. Public traffic is forwarded as raw TCP afte
 
 ## Compared to Cloudflare Tunnel
 
-`muxbridge-e2e` and Cloudflare Tunnel solve a similar deployment problem: expose services behind NAT or a firewall without opening inbound ports on the private side. The biggest difference is where TLS terminates and who owns the public ingress layer.
+`muxbridge-e2e` and Cloudflare Tunnel solve a similar deployment problem: expose services behind NAT or a firewall without opening inbound ports on the private side. The biggest difference is where TLS terminates, who owns the public ingress layer, and whether the browser's TLS session survives all the way to the private environment.
 
 | | Cloudflare Tunnel | muxbridge-e2e |
 |---|---|---|
 | Control plane ownership | `cloudflared` connects to Cloudflare's network | client connects to your own self-hosted edge |
 | Browser request path | browser -> Cloudflare -> origin | browser -> your edge -> your client |
 | Browser-facing TLS for published HTTPS | Cloudflare handles a browser-to-Cloudflare connection, then a separate Cloudflare-to-origin connection | the edge peeks SNI and forwards the same raw TLS stream to the client |
+| End-to-end encryption model | Cloudflare documents two connections: one between the browser and Cloudflare, and another between Cloudflare and the origin | one browser-to-client TLS session is preserved through the edge, so app hostnames stay encrypted end to end |
 | Certificates for public app hostnames | Cloudflare serves the visitor-facing certificate at its edge; origin certs protect the Cloudflare-to-origin leg | the client owns the public-host certificate and private key |
 | Private-side exposure | outbound-only connector, no inbound ports required | outbound-only client, no inbound ports required |
 | Transport to the private side | `cloudflared` establishes outbound connections to Cloudflare using HTTP/2 or QUIC | one outbound TLS connection to your edge with ALPN `muxbridge-control/1`, multiplexed with `yamux` |
@@ -69,7 +70,7 @@ This is not an HTTP-over-RPC tunnel. Public traffic is forwarded as raw TCP afte
 | Origin client IP model | for HTTP, Cloudflare documents `CF-Connecting-IP`; for non-HTTP protocols the original client IP is not available to the origin | the edge carries the remote address through the tunnel and the client proxy sets `X-Forwarded-For` |
 | Product focus | managed edge service with Cloudflare network features | self-hosted SNI-routed TLS passthrough with client-side certificate ownership |
 
-If you want Cloudflare's global edge features, Cloudflare Tunnel is built for that model. If you want the public hostname TLS session itself to terminate inside your private client environment, `muxbridge-e2e` is built for that model.
+If you want Cloudflare's global edge features, Cloudflare Tunnel is built for that model. If you want the browser's TLS session for the public hostname to terminate inside your private client environment instead of at a third-party edge, `muxbridge-e2e` is built for that model.
 
 ## Architecture
 
