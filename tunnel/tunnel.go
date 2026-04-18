@@ -62,7 +62,13 @@ type Config struct {
 
 // Client is a muxbridge-e2e tunnel client.
 type Client struct {
-	svc *client.Service
+	svc service
+}
+
+type service interface {
+	Start(context.Context) error
+	Wait() <-chan struct{}
+	Close(context.Context) error
 }
 
 // New creates a new tunnel [Client]. Call [Client.Run] to start it.

@@ -1,0 +1,471 @@
+package edge
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/caddyserver/certmagic"
+	"github.com/hashicorp/yamux"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
+	"github.com/define42/muxbridge-e2e/internal/config"
+	"github.com/define42/muxbridge-e2e/internal/control"
+	controlpb "github.com/define42/muxbridge-e2e/proto"
+)
+
+func TestAuthorizeRegistration(t *testing.T) {
+	t.Parallel()
+
+	service := New(config.EdgeConfig{
+		EdgeDomain: "edge.example.test",
+		ClientCredentials: map[string][]string{
+			"demo-token": {"Demo.Example.Test", "API.EXAMPLE.TEST"},
+		},
+	}, Options{})
+
+	hostnames, err := service.authorizeRegistration(&controlpb.RegisterRequest{
+		Token:     "demo-token",
+		Hostnames: []string{"api.example.test", "demo.example.test"},
+	})
+	if err != nil {
+		t.Fatalf("authorizeRegistration() error = %v", err)
+	}
+	if want := []string{"api.example.test", "demo.example.test"}; !slicesEqual(hostnames, want) {
+		t.Fatalf("authorizeRegistration() = %v, want %v", hostnames, want)
+	}
+
+	if _, err := service.authorizeRegistration(&controlpb.RegisterRequest{Token: "missing"}); err == nil || !strings.Contains(err.Error(), "unknown client token") {
+		t.Fatalf("authorizeRegistration(missing) error = %v, want unknown token", err)
+	}
+	if _, err := service.authorizeRegistration(&controlpb.RegisterRequest{
+		Token:     "demo-token",
+		Hostnames: []string{"other.example.test"},
+	}); err == nil || !strings.Contains(err.Error(), "exactly match") {
+		t.Fatalf("authorizeRegistration(mismatch) error = %v, want exact match error", err)
+	}
+}
+
+func TestEdgeHTTPHandlerAndPublicHTTPHandler(t *testing.T) {
+	t.Parallel()
+
+	service := New(config.EdgeConfig{
+		EdgeDomain: "edge.example.test",
+	}, Options{Registerer: prometheus.NewRegistry()})
+	service.httpsListener = stubListener{addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8443}}
+	service.httpListener = stubListener{addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}}
+
+	session := &clientSession{
+		token:     "demo-token",
+		hostnames: []string{"demo.example.test"},
+		registry:  service.registry,
+		closed:    make(chan struct{}),
+	}
+	if _, err := service.registry.activate(session); err != nil {
+		t.Fatalf("activate() error = %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		handler    http.Handler
+		target     string
+		host       string
+		wantStatus int
+		wantBody   string
+		wantHeader string
+	}{
+		{
+			name:       "healthz",
+			handler:    service.edgeHTTPHandler(),
+			target:     "http://edge.example.test/healthz",
+			host:       "edge.example.test",
+			wantStatus: http.StatusOK,
+			wantBody:   "ok\n",
+		},
+		{
+			name:       "readyz",
+			handler:    service.edgeHTTPHandler(),
+			target:     "http://edge.example.test/readyz",
+			host:       "edge.example.test",
+			wantStatus: http.StatusOK,
+			wantBody:   "ready\n",
+		},
+		{
+			name:       "status page",
+			handler:    service.edgeHTTPHandler(),
+			target:     "http://edge.example.test/",
+			host:       "edge.example.test",
+			wantStatus: http.StatusOK,
+			wantBody:   "active_sessions: 1",
+			wantHeader: "text/plain; charset=utf-8",
+		},
+		{
+			name:       "public status passthrough",
+			handler:    service.publicHTTPHandler(),
+			target:     "http://edge.example.test/readyz",
+			host:       "edge.example.test",
+			wantStatus: http.StatusOK,
+			wantBody:   "ready\n",
+		},
+		{
+			name:       "public redirect",
+			handler:    service.publicHTTPHandler(),
+			target:     "http://demo.example.test/path?q=1",
+			host:       "demo.example.test",
+			wantStatus: http.StatusPermanentRedirect,
+			wantHeader: "https://demo.example.test:8443/path?q=1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.target, nil)
+			req.Host = tt.host
+			rec := httptest.NewRecorder()
+			tt.handler.ServeHTTP(rec, req)
+
+			resp := rec.Result()
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			if tt.wantBody != "" {
+				body := rec.Body.String()
+				if !strings.Contains(body, tt.wantBody) {
+					t.Fatalf("body = %q, want substring %q", body, tt.wantBody)
+				}
+			}
+			if tt.name == "status page" {
+				if got := resp.Header.Get("Content-Type"); got != tt.wantHeader {
+					t.Fatalf("Content-Type = %q, want %q", got, tt.wantHeader)
+				}
+			}
+			if tt.name == "public redirect" {
+				if got := resp.Header.Get("Location"); got != tt.wantHeader {
+					t.Fatalf("Location = %q, want %q", got, tt.wantHeader)
+				}
+			}
+		})
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://edge.example.test/metrics", nil)
+	req.Host = "edge.example.test"
+	rec := httptest.NewRecorder()
+	service.edgeHTTPHandler().ServeHTTP(rec, req)
+	if rec.Result().StatusCode != http.StatusOK {
+		t.Fatalf("/metrics status = %d, want %d", rec.Result().StatusCode, http.StatusOK)
+	}
+	if got := service.HTTPSAddr(); got != "127.0.0.1:8443" {
+		t.Fatalf("HTTPSAddr() = %q, want %q", got, "127.0.0.1:8443")
+	}
+	if got := service.HTTPAddr(); got != "127.0.0.1:8080" {
+		t.Fatalf("HTTPAddr() = %q, want %q", got, "127.0.0.1:8080")
+	}
+}
+
+func TestRunControlLoopHeartbeatsAndUnexpectedMessage(t *testing.T) {
+	t.Parallel()
+
+	service := New(config.EdgeConfig{
+		HeartbeatInterval: config.Duration{Duration: 10 * time.Millisecond},
+		HeartbeatTimeout:  config.Duration{Duration: 30 * time.Millisecond},
+	}, Options{Registerer: prometheus.NewRegistry()})
+
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+
+	_, muxSession := newYamuxPair(t)
+	session := &clientSession{
+		id:            "session-1",
+		token:         "demo-token",
+		mux:           muxSession,
+		controlStream: serverConn,
+		controlWriter: control.NewLockedWriter(serverConn),
+		registry:      service.registry,
+		closed:        make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		service.runControlLoop(session, serverConn)
+		close(done)
+	}()
+
+	if err := control.WriteEnvelope(clientConn, &controlpb.Envelope{
+		Message: &controlpb.Envelope_Heartbeat{
+			Heartbeat: &controlpb.Heartbeat{UnixNano: 123},
+		},
+	}); err != nil {
+		t.Fatalf("WriteEnvelope(heartbeat) error = %v", err)
+	}
+
+	ack, err := control.ReadEnvelope(clientConn)
+	if err != nil {
+		t.Fatalf("ReadEnvelope(ack) error = %v", err)
+	}
+	if ack.GetHeartbeatAck().GetUnixNano() != 123 {
+		t.Fatalf("HeartbeatAck.UnixNano = %d, want %d", ack.GetHeartbeatAck().GetUnixNano(), 123)
+	}
+
+	if err := control.WriteEnvelope(clientConn, &controlpb.Envelope{
+		Message: &controlpb.Envelope_RegisterResponse{
+			RegisterResponse: &controlpb.RegisterResponse{Accepted: true},
+		},
+	}); err != nil {
+		t.Fatalf("WriteEnvelope(unexpected) error = %v", err)
+	}
+	waitClosed(t, done)
+}
+
+func TestHandleControlConnRejectsInvalidRegistrations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		firstFrame  *controlpb.Envelope
+		wantAccept  bool
+		wantMessage string
+	}{
+		{
+			name: "wrong first frame",
+			firstFrame: &controlpb.Envelope{
+				Message: &controlpb.Envelope_Heartbeat{Heartbeat: &controlpb.Heartbeat{UnixNano: 1}},
+			},
+			wantAccept:  false,
+			wantMessage: "first control frame must be register_request",
+		},
+		{
+			name: "unknown token",
+			firstFrame: &controlpb.Envelope{
+				Message: &controlpb.Envelope_RegisterRequest{
+					RegisterRequest: &controlpb.RegisterRequest{
+						Token:     "missing",
+						Hostnames: []string{"demo.example.test"},
+					},
+				},
+			},
+			wantAccept:  false,
+			wantMessage: "unknown client token",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service := New(config.EdgeConfig{
+				ClientCredentials: map[string][]string{
+					"demo-token": {"demo.example.test"},
+				},
+				HeartbeatInterval: config.Duration{Duration: 10 * time.Millisecond},
+				HeartbeatTimeout:  config.Duration{Duration: 30 * time.Millisecond},
+			}, Options{Registerer: prometheus.NewRegistry()})
+
+			serverConn, clientConn := net.Pipe()
+			defer func() { _ = clientConn.Close() }()
+
+			done := make(chan struct{})
+			go func() {
+				service.handleControlConn(context.Background(), serverConn)
+				close(done)
+			}()
+
+			clientSession, err := yamux.Client(clientConn, nil)
+			if err != nil {
+				t.Fatalf("yamux.Client() error = %v", err)
+			}
+			defer func() { _ = clientSession.Close() }()
+
+			stream, err := clientSession.OpenStream()
+			if err != nil {
+				t.Fatalf("OpenStream() error = %v", err)
+			}
+			defer func() { _ = stream.Close() }()
+
+			if err := control.WriteEnvelope(stream, tt.firstFrame); err != nil {
+				t.Fatalf("WriteEnvelope() error = %v", err)
+			}
+
+			resp, err := control.ReadEnvelope(stream)
+			if err != nil {
+				t.Fatalf("ReadEnvelope() error = %v", err)
+			}
+			if resp.GetRegisterResponse().GetAccepted() != tt.wantAccept {
+				t.Fatalf("Accepted = %v, want %v", resp.GetRegisterResponse().GetAccepted(), tt.wantAccept)
+			}
+			if got := resp.GetRegisterResponse().GetMessage(); !strings.Contains(got, tt.wantMessage) {
+				t.Fatalf("Message = %q, want substring %q", got, tt.wantMessage)
+			}
+
+			waitClosed(t, done)
+		})
+	}
+}
+
+func TestHandleControlConnRegistersSession(t *testing.T) {
+	t.Parallel()
+
+	service := New(config.EdgeConfig{
+		ClientCredentials: map[string][]string{
+			"demo-token": {"demo.example.test"},
+		},
+		HeartbeatInterval: config.Duration{Duration: 10 * time.Millisecond},
+		HeartbeatTimeout:  config.Duration{Duration: 30 * time.Millisecond},
+	}, Options{Registerer: prometheus.NewRegistry()})
+
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		service.handleControlConn(context.Background(), serverConn)
+		close(done)
+	}()
+
+	clientSession, err := yamux.Client(clientConn, nil)
+	if err != nil {
+		t.Fatalf("yamux.Client() error = %v", err)
+	}
+	defer func() { _ = clientSession.Close() }()
+
+	stream, err := clientSession.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	if err := control.WriteEnvelope(stream, &controlpb.Envelope{
+		Message: &controlpb.Envelope_RegisterRequest{
+			RegisterRequest: &controlpb.RegisterRequest{
+				Token:     "demo-token",
+				Hostnames: []string{"demo.example.test"},
+				SessionId: "session-1",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("WriteEnvelope(register) error = %v", err)
+	}
+
+	resp, err := control.ReadEnvelope(stream)
+	if err != nil {
+		t.Fatalf("ReadEnvelope(register response) error = %v", err)
+	}
+	if !resp.GetRegisterResponse().GetAccepted() {
+		t.Fatalf("Accepted = %v, want true", resp.GetRegisterResponse().GetAccepted())
+	}
+	if got := service.registry.lookup("demo.example.test"); got == nil {
+		t.Fatal("registry.lookup() returned nil for active session")
+	}
+
+	if err := control.WriteEnvelope(stream, &controlpb.Envelope{
+		Message: &controlpb.Envelope_Heartbeat{
+			Heartbeat: &controlpb.Heartbeat{UnixNano: 99},
+		},
+	}); err != nil {
+		t.Fatalf("WriteEnvelope(heartbeat) error = %v", err)
+	}
+	ack, err := control.ReadEnvelope(stream)
+	if err != nil {
+		t.Fatalf("ReadEnvelope(heartbeat ack) error = %v", err)
+	}
+	if ack.GetHeartbeatAck().GetUnixNano() != 99 {
+		t.Fatalf("HeartbeatAck.UnixNano = %d, want %d", ack.GetHeartbeatAck().GetUnixNano(), 99)
+	}
+
+	_ = clientSession.Close()
+	waitClosed(t, done)
+}
+
+func TestHelpers(t *testing.T) {
+	t.Parallel()
+
+	service := New(config.EdgeConfig{}, Options{})
+	cfg := service.yamuxConfig()
+	if cfg.EnableKeepAlive {
+		t.Fatal("yamuxConfig().EnableKeepAlive = true, want false")
+	}
+
+	if got := uniqueStrings("h2", "http/1.1", "h2"); !slicesEqual(got, []string{"h2", "http/1.1"}) {
+		t.Fatalf("uniqueStrings() = %v, want %v", got, []string{"h2", "http/1.1"})
+	}
+	if got := redirectHost("demo.example.test:80", "127.0.0.1:8443"); got != "demo.example.test:8443" {
+		t.Fatalf("redirectHost() = %q, want %q", got, "demo.example.test:8443")
+	}
+	if got := redirectHost("demo.example.test", "127.0.0.1:443"); got != "demo.example.test" {
+		t.Fatalf("redirectHost() = %q, want %q", got, "demo.example.test")
+	}
+	if got := stripPort("demo.example.test:443"); got != "demo.example.test" {
+		t.Fatalf("stripPort() = %q, want %q", got, "demo.example.test")
+	}
+	if got := stripPort("demo.example.test"); got != "demo.example.test" {
+		t.Fatalf("stripPort() = %q, want unchanged host", got)
+	}
+	if got := remoteIP(&net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}); got != "192.0.2.1" {
+		t.Fatalf("remoteIP() = %q, want %q", got, "192.0.2.1")
+	}
+	if got := remoteIP(nil); got != "" {
+		t.Fatalf("remoteIP(nil) = %q, want empty string", got)
+	}
+	if got := newSessionID(); len(got) == 0 {
+		t.Fatal("newSessionID() returned an empty string")
+	}
+}
+
+func TestNewCertManagerUsesCustomFactory(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	manager := newCertManager(
+		t.TempDir(),
+		func(cm *certmagic.Config) certmagic.Issuer {
+			called = true
+			return certmagic.NewACMEIssuer(cm, certmagic.ACMEIssuer{Email: "custom@example.test"})
+		},
+		func(cm *certmagic.Config) certmagic.Issuer {
+			t.Fatal("default factory should not be used when customFactory is set")
+			return nil
+		},
+	)
+
+	if !called {
+		t.Fatal("customFactory was not called")
+	}
+	if len(manager.Issuers) != 1 {
+		t.Fatalf("len(manager.Issuers) = %d, want %d", len(manager.Issuers), 1)
+	}
+	if _, ok := manager.Issuers[0].(*certmagic.ACMEIssuer); !ok {
+		t.Fatalf("manager.Issuers[0] type = %T, want *certmagic.ACMEIssuer", manager.Issuers[0])
+	}
+}
+
+func slicesEqual(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+type stubListener struct {
+	addr net.Addr
+}
+
+func (l stubListener) Accept() (net.Conn, error) { return nil, context.Canceled }
+func (l stubListener) Close() error              { return nil }
+func (l stubListener) Addr() net.Addr            { return l.addr }
+
+func counterValue(t *testing.T, counter prometheus.Counter) float64 {
+	t.Helper()
+
+	metric := &dto.Metric{}
+	if err := counter.Write(metric); err != nil {
+		t.Fatalf("counter.Write() error = %v", err)
+	}
+	return metric.GetCounter().GetValue()
+}
