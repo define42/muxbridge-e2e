@@ -24,12 +24,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
-	"muxbridge-e2e/internal/config"
-	"muxbridge-e2e/internal/control"
-	listenerpkg "muxbridge-e2e/internal/listener"
-	muxpkg "muxbridge-e2e/internal/mux"
-	"muxbridge-e2e/internal/sni"
-	controlpb "muxbridge-e2e/proto"
+	"github.com/define42/muxbridge-e2e/internal/config"
+	"github.com/define42/muxbridge-e2e/internal/control"
+	listenerpkg "github.com/define42/muxbridge-e2e/internal/listener"
+	muxpkg "github.com/define42/muxbridge-e2e/internal/mux"
+	"github.com/define42/muxbridge-e2e/internal/sni"
+	controlpb "github.com/define42/muxbridge-e2e/proto"
 )
 
 const maxClientHelloBytes = 64 << 10

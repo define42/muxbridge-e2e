@@ -1,4 +1,4 @@
-module muxbridge-e2e
+module github.com/define42/muxbridge-e2e
 
 go 1.26
 

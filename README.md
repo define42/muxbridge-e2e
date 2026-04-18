@@ -1,14 +1,12 @@
 # muxbridge-e2e [![codecov](https://codecov.io/gh/define42/muxbridge-e2e/graph/badge.svg?token=C2WK7GLWU3)](https://codecov.io/gh/define42/muxbridge-e2e)
 
-Self-hosted SNI-routed TLS passthrough tunnel. A public `edge` accepts browser connections on `:443`, peeks only the TLS ClientHello to extract SNI and ALPN, and forwards the raw encrypted bytes over a yamux-multiplexed control connection to a `client` running inside a private network. The client owns the certificates and terminates TLS locally, so the browser's TLS session terminates inside your infrastructure — not at a third-party edge.
-
-No inbound ports on the `client` side. No VPN. `edge` holds no certificate or private key for tunneled hostnames and cannot decrypt tunneled traffic.
+MuxBridge-e2e is a self-hosted TLS tunnel gateway inspired by Cloudflare Tunnel. It lets you securely expose TLS services running behind NAT or a firewall to the public internet — no inbound firewall rules or port forwarding required.
 
 ## Why
 
 If you use Cloudflare Tunnel, Cloudflare terminates the browser's TLS session at its edge and opens a separate TLS connection to your origin. Two sessions are stitched together, so Cloudflare sees the plaintext and can inspect or modify it.
 
-`muxbridge-e2e` is built for end-2-end encryption. `edge` peeks only the SNI and forwards the raw TLS stream unchanged; a single TLS session runs from the browser all the way to your `client`. 
+`muxbridge-e2e` is built for end-2-end encryption. MuxBridge-e2e peeks only the TLS-ClientHello SNI and forwards the raw TLS stream unchanged; a single TLS session runs from the browser all the way to your `client`. 
 
 ## How It Works
 
@@ -97,6 +95,65 @@ Direct invocation:
 ```
 
 A real deployment also needs: DNS for `edge_domain` and every tunneled hostname pointing at the public `edge`, public reachability on `:80` and `:443`, and a writable `data_dir` on the `client` for CertMagic state.
+
+## Client Library
+
+You can embed the tunnel client directly in your Go application instead of running the standalone binary:
+
+```go
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+
+	"github.com/define42/muxbridge-e2e/tunnel"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "hello world")
+	})
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	client, err := tunnel.New(tunnel.Config{
+		EdgeAddr:  "edge.example.com:443",
+		Token:     "my-secret-token",
+		Hostnames: []string{"app.example.com"},
+		Handler:   mux,
+		DataDir:   "/var/lib/myapp/certs",
+		AcmeEmail: "ops@example.com",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := client.Run(ctx); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+`tunnel.Config` fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `EdgeAddr` | yes | `host:port` of the edge server |
+| `Token` | yes | Authentication token (must match `client_credentials` on the edge) |
+| `Handler` | yes | `http.Handler` that receives decrypted requests |
+| `Hostnames` | yes | Hostnames to register (must exactly match the token's allowed set) |
+| `DataDir` | yes* | Writable dir for ACME cert/account storage (*not required when `TLSConfig` is set) |
+| `AcmeEmail` | no | Contact email for ACME issuance |
+| `TLSConfig` | no | Custom `*tls.Config` for TLS termination (bypasses ACME) |
+| `ControlTLS` | no | Custom `*tls.Config` for the control connection to the edge |
+| `Logger` | no | `*slog.Logger` (defaults to `slog.Default()`) |
+| `ReconnectMin` | no | Min reconnect backoff (default 1 s) |
+| `ReconnectMax` | no | Max reconnect backoff (default 30 s) |
 
 ## Docker
 

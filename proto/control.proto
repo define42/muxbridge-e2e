@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package control;
 
-option go_package = "muxbridge-e2e/proto;controlpb";
+option go_package = "github.com/define42/muxbridge-e2e/proto;controlpb";
 
 message Envelope {
   oneof message {

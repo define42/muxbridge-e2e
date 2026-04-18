@@ -1,16 +1,16 @@
 BIN_DIR := bin
 PROTO := proto/control.proto
 PROTO_GEN := proto/control.pb.go
-GO_SOURCES := $(shell find cmd internal proto -name '*.go' -print)
+GO_SOURCES := $(shell find cmd internal proto tunnel -name '*.go' -print)
 EDGE_CONFIG ?= examples/edge.yaml
 CLIENT_CONFIG ?= examples/client.yaml
 GOLANGCI_LINT_VERSION ?= v2.11.4
 
-.PHONY: all build proto edge client test unit integration fmt tidy lint clean run-edge run-client help
+.PHONY: all build proto edge client check-tunnel test unit integration fmt tidy lint clean run-edge run-client help
 
 all: build
 
-build: edge client
+build: edge client check-tunnel
 
 proto: $(PROTO_GEN)
 
@@ -29,6 +29,9 @@ $(BIN_DIR)/edge: $(PROTO_GEN) $(GO_SOURCES) | $(BIN_DIR)
 
 $(BIN_DIR)/client: $(PROTO_GEN) $(GO_SOURCES) | $(BIN_DIR)
 	go build -trimpath -o $@ ./cmd/client
+
+check-tunnel:
+	go build ./tunnel/...
 
 test:
 	go test ./...
@@ -61,8 +64,9 @@ run-client:
 help:
 	@printf '%s\n' \
 		'Available targets:' \
-		'  make build        Build edge and client binaries into $(BIN_DIR)/' \
-		'  make proto        Regenerate protobuf bindings from $(PROTO)' \
+		'  make build          Build edge and client binaries into $(BIN_DIR)/' \
+		'  make check-tunnel   Verify tunnel library compiles' \
+		'  make proto          Regenerate protobuf bindings from $(PROTO)' \
 		'  make test         Run all Go tests' \
 		'  make unit         Run tests except integration package' \
 		'  make integration  Run integration tests only' \

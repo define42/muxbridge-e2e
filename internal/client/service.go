@@ -19,12 +19,12 @@ import (
 	"github.com/hashicorp/yamux"
 	"go.uber.org/zap"
 
-	"muxbridge-e2e/internal/config"
-	"muxbridge-e2e/internal/control"
-	listenerpkg "muxbridge-e2e/internal/listener"
-	"muxbridge-e2e/internal/proxy"
-	"muxbridge-e2e/internal/sni"
-	controlpb "muxbridge-e2e/proto"
+	"github.com/define42/muxbridge-e2e/internal/config"
+	"github.com/define42/muxbridge-e2e/internal/control"
+	listenerpkg "github.com/define42/muxbridge-e2e/internal/listener"
+	"github.com/define42/muxbridge-e2e/internal/proxy"
+	"github.com/define42/muxbridge-e2e/internal/sni"
+	controlpb "github.com/define42/muxbridge-e2e/proto"
 )
 
 var errSessionReplaced = errors.New("session replaced by newer client")
@@ -36,6 +36,7 @@ type Options struct {
 	CertIssuerFactory   func(*certmagic.Config) certmagic.Issuer
 	ManageSynchronously bool
 	HandshakeObserver   func(sni.ClientHelloInfo)
+	Handler             http.Handler
 }
 
 type Service struct {
@@ -66,15 +67,21 @@ func New(cfg config.ClientConfig, opts Options) (*Service, error) {
 	if dialContext == nil {
 		dialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	}
-	proxyHandler, err := proxy.New(cfg.Routes, logger)
-	if err != nil {
-		return nil, err
+	var handler http.Handler
+	if opts.Handler != nil {
+		handler = opts.Handler
+	} else {
+		proxyHandler, err := proxy.New(cfg.Routes, logger)
+		if err != nil {
+			return nil, err
+		}
+		handler = proxyHandler
 	}
 
 	tlsConfig, certManager := buildClientTLSConfig(cfg.DataDir, cfg.AcmeEmail, opts.CertIssuerFactory)
 
 	server := &http.Server{
-		Handler: proxyHandler,
+		Handler: handler,
 	}
 	rawListener := listenerpkg.NewQueueListener(&net.TCPAddr{IP: net.IPv4zero, Port: 0}, 256)
 
@@ -119,6 +126,10 @@ func (s *Service) Start(ctx context.Context) error {
 		s.connectLoop(ctx)
 	}()
 	return nil
+}
+
+func (s *Service) Wait() <-chan struct{} {
+	return s.done
 }
 
 func (s *Service) Close(ctx context.Context) error {

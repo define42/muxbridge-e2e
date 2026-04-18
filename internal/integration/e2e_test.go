@@ -27,10 +27,10 @@ import (
 	"github.com/caddyserver/certmagic"
 	"github.com/gorilla/websocket"
 
-	"muxbridge-e2e/internal/client"
-	"muxbridge-e2e/internal/config"
-	"muxbridge-e2e/internal/edge"
-	"muxbridge-e2e/internal/sni"
+	"github.com/define42/muxbridge-e2e/internal/client"
+	"github.com/define42/muxbridge-e2e/internal/config"
+	"github.com/define42/muxbridge-e2e/internal/edge"
+	"github.com/define42/muxbridge-e2e/internal/sni"
 )
 
 func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {

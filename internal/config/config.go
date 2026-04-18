@@ -110,6 +110,11 @@ func (c *EdgeConfig) applyDefaults() {
 }
 
 func (c *ClientConfig) applyDefaults() {
+	c.ApplyDefaults()
+}
+
+// ApplyDefaults fills zero-valued timing fields with their defaults.
+func (c *ClientConfig) ApplyDefaults() {
 	if c.ReconnectMin.Duration == 0 {
 		c.ReconnectMin.Duration = defaultReconnectMin
 	}

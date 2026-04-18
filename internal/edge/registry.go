@@ -7,8 +7,8 @@ import (
 
 	"github.com/hashicorp/yamux"
 
-	"muxbridge-e2e/internal/control"
-	controlpb "muxbridge-e2e/proto"
+	"github.com/define42/muxbridge-e2e/internal/control"
+	controlpb "github.com/define42/muxbridge-e2e/proto"
 )
 
 type clientSession struct {

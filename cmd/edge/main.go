@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"muxbridge-e2e/internal/config"
-	"muxbridge-e2e/internal/edge"
+	"github.com/define42/muxbridge-e2e/internal/config"
+	"github.com/define42/muxbridge-e2e/internal/edge"
 )
 
 func main() {

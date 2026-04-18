@@ -8,7 +8,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	controlpb "muxbridge-e2e/proto"
+	controlpb "github.com/define42/muxbridge-e2e/proto"
 )
 
 const maxFrameSize = 1 << 20
