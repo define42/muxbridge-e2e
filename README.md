@@ -1,164 +1,41 @@
 # muxbridge-e2e [![codecov](https://codecov.io/gh/define42/muxbridge-e2e/graph/badge.svg?token=C2WK7GLWU3)](https://codecov.io/gh/define42/muxbridge-e2e)
 
-`muxbridge-e2e` is a self-hosted SNI-routed TLS passthrough tunnel.
+Self-hosted SNI-routed TLS passthrough tunnel. A public `edge` peeks the TLS ClientHello to extract SNI and ALPN, then forwards the raw encrypted stream over a yamux-multiplexed control connection to a `client` running in a private network. The client owns the certificates and terminates TLS locally, so the browser's TLS session is preserved end to end.
 
-It is built for the case where you want a public ingress point on the internet, but you do **not** want that ingress point to terminate TLS for your application hostnames. `muxbridge-e2e Edge` reads only enough of the TLS ClientHello to extract SNI and ALPN, selects the right connected `muxbridge-e2e Client`, and forwards the raw encrypted TCP stream unchanged. `muxbridge-e2e Client` owns the certificates, finishes the TLS handshake locally, and proxies the decrypted HTTP traffic to a local origin.
+No inbound ports on the `client` side. No VPN. `edge` never decrypts tunneled app traffic and never stores app certs.
 
 ## How It Works
 
 ```text
-Browser --TLS--> muxbridge-e2e Edge (public)
-                  |
-                  | peek ClientHello: SNI + ALPN only
-                  v
-             yamux data stream over
-        persistent TLS control connection
-                  v
-muxbridge-e2e Client (private network) --local TLS termination--> Local origin
+Browser --TLS--> edge (public)
+                   | peek SNI + ALPN
+                   v
+              yamux stream over persistent TLS
+                   v
+              client (private) --TLS terminate--> local origin
 ```
 
-You run the `muxbridge-e2e Edge` binary on a public machine. The `muxbridge-e2e Client` binary runs wherever the private application lives: behind NAT, behind a firewall, or on an internal network with no inbound port exposure.
+1. `client` dials `edge` over a long-lived TLS connection using ALPN `muxbridge-control/1`. Inside that connection, yamux carries control messages and one raw byte stream per public TCP connection.
+2. A browser connects to `edge:443`. `edge` reads only enough of the ClientHello to learn the SNI hostname and ALPN list.
+3. If that hostname is registered by a connected `client`, `edge` opens a yamux data stream and forwards the raw TCP bytes unchanged. `tls-alpn-01` (`acme-tls/1`) traverses this path unmodified.
+4. `client` completes the TLS handshake with its own certificate and reverse-proxies the decrypted HTTP to the local origin from its `routes` map.
 
-`muxbridge-e2e Client` first dials out to `muxbridge-e2e Edge` over one long-lived TLS connection using ALPN `muxbridge-control/1`. Inside that connection, `yamux` carries both control messages and one raw byte stream for each public TCP connection.
-
-When a browser connects to `https://demo.example.com`, the flow looks like this:
-
-1. The browser opens a normal TLS connection to `muxbridge-e2e Edge`.
-2. `muxbridge-e2e Edge` reads only enough of the ClientHello to learn the requested hostname and ALPN.
-3. If that hostname belongs to a connected `muxbridge-e2e Client`, `muxbridge-e2e Edge` opens a `yamux` data stream to that client and forwards the raw TCP bytes unchanged.
-4. `muxbridge-e2e Client` treats that stream like a real `net.Conn`, completes the TLS handshake locally with its own certificate, and hands the decrypted HTTP traffic to the configured local origin from its `routes` map.
-5. The response travels back through the same path to the browser.
-
-That means `muxbridge-e2e Edge` makes the routing decision, but `muxbridge-e2e Client` owns the application TLS session.
-
-The important bit is the trust boundary:
-
-- `muxbridge-e2e Edge` never decrypts tunneled app traffic
-- `muxbridge-e2e Edge` never stores certs or private keys for tunneled app hostnames
-- `tls-alpn-01` for tunneled hostnames reaches `muxbridge-e2e Client` unchanged
-- `muxbridge-e2e Client` keeps ACME account data and private keys under its own data dir
-
-No inbound ports on the machine running `muxbridge-e2e Client`. No VPN. No `muxbridge-e2e Edge` certificate ownership for app hostnames.
-
-This is not an HTTP-over-RPC tunnel. Public traffic is forwarded as raw TCP after SNI routing.
-
-## Key Features
-
-- **SNI-based TLS passthrough** for exact public hostnames
-- **Client-owned certificates** with CertMagic on `muxbridge-e2e Client`
-- **Single outbound `muxbridge-e2e Client` connection** to `muxbridge-e2e Edge`, with no inbound ports required on the private network
-- **Multiplexed transport** with one `yamux` session per connected `muxbridge-e2e Client`
-- **Session replacement and draining** when a newer `muxbridge-e2e Client` for the same token connects
-- **WebSocket, SSE, streaming HTTP, and normal HTTPS** over the same passthrough path
-- **Edge-local status and metrics** on the `muxbridge-e2e Edge` domain only
-- **Prometheus metrics** for sessions, hostnames, heartbeats, stream counts, and routing failures
+`edge` makes the routing decision; `client` owns the application TLS session. Control messages use a small protobuf envelope in [proto/control.proto](proto/control.proto).
 
 ## Compared to Cloudflare Tunnel
 
-`muxbridge-e2e` and Cloudflare Tunnel solve a similar deployment problem: expose services behind NAT or a firewall without opening inbound ports on the private side. The biggest difference is where TLS terminates, who owns the public ingress layer, and whether the browser's TLS session survives all the way to the private environment.
+Both expose services behind NAT without opening inbound ports. The key difference is where browser TLS terminates:
 
-| | Cloudflare Tunnel | muxbridge-e2e |
-|---|---|---|
-| Control plane ownership | `cloudflared` connects to Cloudflare's network | `muxbridge-e2e Client` connects to your own self-hosted `muxbridge-e2e Edge` |
-| Browser request path | browser -> Cloudflare -> `cloudflared` -> local origin | browser -> `muxbridge-e2e Edge` -> `muxbridge-e2e Client` -> local origin |
-| Browser-facing TLS for published HTTPS | Cloudflare handles a browser-to-Cloudflare connection, then a separate Cloudflare-to-local-origin connection | `muxbridge-e2e Edge` peeks SNI and forwards the same raw TLS stream to `muxbridge-e2e Client` |
-| End-to-end encryption model | Cloudflare documents two connections: one between the browser and Cloudflare, and another between Cloudflare and the local origin | one browser-to-`muxbridge-e2e Client` TLS session is preserved through `muxbridge-e2e Edge`, so app hostnames stay encrypted end to end |
-| Certificates for public app hostnames | Cloudflare serves the visitor-facing certificate at its edge; local origin certs protect the Cloudflare-to-local-origin leg | `muxbridge-e2e Client` owns the public-host certificate and private key |
-| Private-side exposure | outbound-only connector, no inbound ports required | outbound-only `muxbridge-e2e Client`, no inbound ports required |
-| Transport to the private side | `cloudflared` establishes outbound connections to Cloudflare using HTTP/2 or QUIC | one outbound TLS connection from `muxbridge-e2e Client` to `muxbridge-e2e Edge` with ALPN `muxbridge-control/1`, multiplexed with `yamux` |
-| Layer 7 edge features | Cloudflare applies CDN, WAF, DDoS protection, and related edge services in its network | `muxbridge-e2e Edge` intentionally does not inspect or terminate tunneled app TLS |
-| Origin client IP model | for HTTP, Cloudflare documents `CF-Connecting-IP`; for non-HTTP protocols the original client IP is not available to the origin | `muxbridge-e2e Edge` carries the remote address through the tunnel and `muxbridge-e2e Client` proxy sets `X-Forwarded-For` |
-| Product focus | managed edge service with Cloudflare network features | self-hosted SNI-routed TLS passthrough with `muxbridge-e2e Client` certificate ownership |
+- **Cloudflare Tunnel**: Cloudflare terminates browser TLS at its edge; traffic to the local origin is a separate hop. You get CDN/WAF/DDoS protection but do not own the visitor-facing certificate.
+- **muxbridge-e2e**: `edge` is self-hosted and never terminates tunneled app TLS. The browser's TLS session is preserved into the private environment. You own the edge and the certs.
 
-If you want Cloudflare's global edge features, Cloudflare Tunnel is built for that model. If you want the browser's TLS session for the public hostname to terminate inside the private environment running `muxbridge-e2e Client` instead of at a third-party edge, `muxbridge-e2e` is built for that model.
-
-## Architecture
-
-### Control Plane
-
-- one persistent `muxbridge-e2e Client`-to-`muxbridge-e2e Edge` TLS connection
-- SNI set to the edge domain
-- ALPN fixed to `muxbridge-control/1`
-- one `yamux` session per connected `muxbridge-e2e Client`
-- one dedicated control stream for register, heartbeat, drain notice, and error reporting
-
-Control messages use a small protobuf envelope defined in [`proto/control.proto`](/home/define42/git/muxbridge-e2e/proto/control.proto).
-
-### Data Plane
-
-- `muxbridge-e2e Edge` listens on raw TCP `:443`
-- `muxbridge-e2e Edge` peeks the ClientHello without consuming it permanently
-- `muxbridge-e2e Edge` extracts the SNI hostname and ALPN list, when present
-- if the hostname is the `muxbridge-e2e Edge` domain, `muxbridge-e2e Edge` terminates TLS locally
-- otherwise `muxbridge-e2e Edge` opens a `yamux` data stream to the registered `muxbridge-e2e Client`
-- each data stream starts with a protobuf `StreamHeader`
-- after the header, the stream is the untouched browser TCP byte flow
-
-### Routing Model
-
-- exact hostname match only in v1
-- a hostname may belong to only one active `muxbridge-e2e Client` session at a time
-- a token must register exactly the hostnames allowed by edge config
-- the newest session for a token replaces the older one
-- disconnected sessions lose their hostnames immediately
-
-## TLS Model
-
-### Tunneled Hostnames
-
-For tunneled public hostnames:
-
-- `muxbridge-e2e Edge` must not terminate TLS
-- `muxbridge-e2e Edge` must not request certificates
-- `muxbridge-e2e Edge` must not store certificates
-- the raw handshake must reach `muxbridge-e2e Client` unchanged
-- `muxbridge-e2e Client` presents the real certificate for the requested hostname
-
-This includes ACME `tls-alpn-01`. If a browser or ACME client offers ALPN `acme-tls/1`, that value is preserved through `muxbridge-e2e Edge` and arrives at the `muxbridge-e2e Client` path unchanged.
-
-### Edge Domain
-
-`muxbridge-e2e Edge` terminates TLS only for the edge domain and serves:
-
-- `/healthz`
-- `/readyz`
-- `/metrics`
-- a small status page at `/`
-
-For the `muxbridge-e2e Edge` domain you can use either:
-
-- static certificate and key files
-- or CertMagic rooted under the `muxbridge-e2e Edge` data dir
-
-`muxbridge-e2e Edge` does not manage certificates for tunneled application hostnames.
+Pick `muxbridge-e2e` when you need the app TLS session to terminate inside the private network rather than at a third-party edge.
 
 ## Config
 
-Example files live in [`examples/edge.yaml`](/home/define42/git/muxbridge-e2e/examples/edge.yaml) and [`examples/client.yaml`](/home/define42/git/muxbridge-e2e/examples/client.yaml).
+See [examples/edge.yaml](examples/edge.yaml) and [examples/client.yaml](examples/client.yaml).
 
-### Edge Config
-
-Required fields:
-
-- `public_domain`
-- `edge_domain`
-- `listen_https`
-- `listen_http`
-- `data_dir`
-- `client_credentials`
-
-Optional fields:
-
-- `tls_cert_file`
-- `tls_key_file`
-- `handshake_timeout`
-- `heartbeat_interval`
-- `heartbeat_timeout`
-- `replace_grace_period`
-
-If `tls_cert_file` and `tls_key_file` are omitted, `muxbridge-e2e Edge` uses CertMagic for `edge_domain` only.
-
-Example:
+### Edge
 
 ```yaml
 public_domain: example.com
@@ -166,238 +43,73 @@ edge_domain: edge.example.com
 listen_https: ":443"
 listen_http: ":80"
 data_dir: "/var/lib/muxbridge-e2e-edge"
-tls_cert_file: "/etc/muxbridge-e2e/edge.crt"
+tls_cert_file: "/etc/muxbridge-e2e/edge.crt"   # optional; omit to use CertMagic for edge_domain
 tls_key_file: "/etc/muxbridge-e2e/edge.key"
-handshake_timeout: "5s"
-heartbeat_interval: "15s"
-heartbeat_timeout: "45s"
-replace_grace_period: "30s"
 client_credentials:
   demo-token:
     - demo.example.com
     - api.demo.example.com
 ```
 
-### Client Config
+Optional timing fields (defaults shown): `handshake_timeout: 5s`, `heartbeat_interval: 15s`, `heartbeat_timeout: 45s`, `replace_grace_period: 30s`.
 
-Required fields:
-
-- `edge_addr`
-- `token`
-- `data_dir`
-- `acme_email`
-- `routes`
-
-Optional fields:
-
-- `reconnect_min`
-- `reconnect_max`
-
-Example:
+### Client
 
 ```yaml
 edge_addr: "edge.example.com:443"
 token: "demo-token"
 data_dir: "/var/lib/muxbridge-e2e-client"
 acme_email: "ops@example.com"
-reconnect_min: "1s"
-reconnect_max: "30s"
 routes:
   demo.example.com: "http://127.0.0.1:8080"
   api.demo.example.com: "http://127.0.0.1:9000"
 ```
 
-## Build
+Optional: `reconnect_min: 1s`, `reconnect_max: 30s`.
 
-Build both binaries with:
-
-```bash
-make build
-```
-
-This produces:
-
-- `bin/edge`
-- `bin/client`
-
-You can also build directly:
+## Build & Run
 
 ```bash
-go build -o bin/edge ./cmd/edge
-go build -o bin/client ./cmd/client
+make build          # produces bin/edge and bin/client
+make test           # full suite (also: make unit, make integration, make lint)
+make run-edge       # runs edge with examples/edge.yaml
+make run-client     # runs client with examples/client.yaml
 ```
 
-## Test
-
-Run the full suite:
-
-```bash
-make test
-```
-
-Useful narrower targets:
-
-```bash
-make lint
-make unit
-make integration
-```
-
-The integration coverage uses live `muxbridge-e2e Edge` and `muxbridge-e2e Client` services with ephemeral listeners and validates the end-to-end TLS passthrough path.
-
-## Run Locally
-
-Start `muxbridge-e2e Edge`:
-
-```bash
-make run-edge
-```
-
-Start `muxbridge-e2e Client`:
-
-```bash
-make run-client
-```
-
-Or run the binaries directly:
-
-```bash
-./bin/edge -config examples/edge.yaml
-./bin/client -config examples/client.yaml
-```
-
-For a real deployment you will usually want:
-
-1. DNS for `edge_domain` pointing at the public `muxbridge-e2e Edge`
-2. DNS for each tunneled hostname pointing at the same `muxbridge-e2e Edge`
-3. public reachability on ports `80` and `443`
-4. writable persistent storage on `muxbridge-e2e Client` for CertMagic state
-
-## Defaults
-
-- handshake timeout: `5s`
-- heartbeat interval: `15s`
-- heartbeat timeout: `45s`
-- reconnect backoff: `1s` to `30s`
-- replacement drain grace: `30s`
-
-## Runtime Behavior
-
-### Port 443
-
-Incoming TLS connections on `listen_https` are handled by `muxbridge-e2e Edge` like this:
-
-- parse ClientHello up to a bounded read cap
-- reject missing SNI, malformed handshakes, and oversized hellos
-- if SNI is the `muxbridge-e2e Edge` domain, terminate TLS locally
-- if SNI is a tunneled hostname, route to the matching `muxbridge-e2e Client` session
-- if no active `muxbridge-e2e Client` owns that hostname, close the TCP connection
-
-Routing failures happen before TLS establishment and return no HTTP error page.
-
-### Port 80
-
-Incoming HTTP on `listen_http` is handled by `muxbridge-e2e Edge` like this:
-
-- `muxbridge-e2e Edge` domain may serve local HTTP endpoints
-- all other public hosts receive `308` redirect to `https://`
-- tunneled hostnames do not use HTTP-01 on `muxbridge-e2e Edge`
-
-## Proxy Behavior
-
-After `muxbridge-e2e Client`-side TLS termination, requests are routed by exact hostname to local origins. In config terms, each local origin is the upstream URL attached to a hostname in the `muxbridge-e2e Client` `routes` map.
-
-The reverse proxy preserves:
-
-- `Host`
-- `X-Forwarded-For`
-- `X-Forwarded-Proto=https`
-- `X-Forwarded-Host`
-- streaming request and response bodies
-- WebSocket upgrades
-- SSE
-
-For v1, local gRPC support is intended for `https://` local origins so the transport to the local origin can use HTTP/2.
-
-## Metrics And Logs
-
-`muxbridge-e2e Edge` exposes Prometheus-format metrics on the edge domain under `/metrics`.
-
-Current metrics include:
-
-- active sessions
-- registered hostnames
-- missed heartbeats
-- streams opened and closed
-- total bytes relayed
-- unknown-host closes
-- missing-SNI closes
-- ClientHello parse failures
-
-Logs are structured and limited to connection metadata such as hostname, remote IP, byte counts, duration, session ID, and error state. Application payloads are not logged.
+For a real deployment: DNS for `edge_domain` and each tunneled hostname pointing at the public `edge`, public reachability on ports 80 and 443, and writable `data_dir` on `client` for CertMagic state.
 
 ## Docker
 
-The repository includes a multi-stage Dockerfile with separate runtime targets for `muxbridge-e2e Edge` and `muxbridge-e2e Client`.
-
-Build the `muxbridge-e2e Edge` image:
-
 ```bash
-docker build -t muxbridge-e2e-edge .
-docker build --target edge -t muxbridge-e2e-edge .
-```
-
-Build the `muxbridge-e2e Client` image:
-
-```bash
+docker build --target edge   -t muxbridge-e2e-edge   .
 docker build --target client -t muxbridge-e2e-client .
 ```
 
-Default entrypoints:
+The edge image exposes ports 80 and 443. Example configs ship under `/etc/muxbridge-e2e/`.
 
-- `muxbridge-e2e Edge`: `/usr/local/bin/edge -config /etc/muxbridge-e2e/edge.yaml`
-- `muxbridge-e2e Client`: `/usr/local/bin/client -config /etc/muxbridge-e2e/client.yaml`
+## Routing & TLS
 
-The `muxbridge-e2e Edge` image exposes ports `80` and `443`. Both images include the example YAML configs under `/etc/muxbridge-e2e/`.
+- Exact hostname match only.
+- A hostname belongs to one active client session at a time; a newer session for the same token replaces the older one after a drain grace period.
+- `edge` terminates TLS only for `edge_domain`, serving `/healthz`, `/readyz`, `/metrics`, and a status page at `/`.
+- For tunneled hostnames, `edge` never requests, stores, or terminates certificates — the raw handshake reaches `client` unchanged.
+- Missing SNI, malformed handshakes, oversized ClientHellos, and unknown hostnames close the TCP connection without an HTTP error page.
+- On port 80: `edge_domain` serves local endpoints; all other hosts receive a 308 redirect to `https://`.
 
-## Security Notes
+## Proxy Behavior
 
-- if SNI is absent or hidden, `muxbridge-e2e Edge` closes the connection
-- ECH is out of scope for v1
-- HTTP/3 and QUIC are out of scope for v1
-- wildcard ACME certificates are out of scope for v1
-- routing is exact-host only in v1
-- tunneled hostnames do not get edge-generated `502` pages
+After client-side TLS termination, requests are routed by exact hostname to local origins. The reverse proxy preserves `Host`, `X-Forwarded-For`, `X-Forwarded-Proto=https`, `X-Forwarded-Host`, WebSocket upgrades, SSE, and streaming request/response bodies.
 
-## Current Coverage
+## Metrics & Logs
 
-The repo includes integration coverage for:
+`edge` exposes Prometheus metrics at `/metrics` on `edge_domain`: active sessions, registered hostnames, missed heartbeats, streams opened/closed, bytes relayed, unknown-host closes, missing-SNI closes, and ClientHello parse failures.
 
-- `muxbridge-e2e Client` registration and activation
-- HTTPS through the tunnel to a local origin
-- separate certificates for the edge domain and tunneled hostname
-- edge-domain TLS and status handlers on the shared `:443` listener
-- WebSocket echo through the tunnel
-- streaming responses through the tunnel
-- session replacement and drain behavior
-- unknown hostname rejection
-- missing SNI rejection
-- `acme-tls/1` passthrough observation
+Logs are structured and limited to connection metadata (hostname, remote IP, byte counts, duration, session ID, error state). Application payloads are not logged.
 
-## Repo Layout
+## Out Of Scope For v1
 
-- `cmd/edge`
-- `cmd/client`
-- `internal/config`
-- `internal/control`
-- `internal/sni`
-- `internal/mux`
-- `internal/edge`
-- `internal/client`
-- `internal/listener`
-- `internal/proxy`
-- `proto`
-
-## Summary
-
-`muxbridge-e2e` exists for the case where you want a self-hosted public ingress point without giving that ingress point ownership of your application TLS. `muxbridge-e2e Edge` makes routing decisions from SNI, then gets out of the way. `muxbridge-e2e Client` owns the keys, the certificates, the TLS handshake, and the local origin relationship.
+- ECH
+- HTTP/3 and QUIC
+- Wildcard ACME certificates
+- Wildcard/prefix routing (exact host only)
+- Edge-generated error pages for tunneled hostnames
