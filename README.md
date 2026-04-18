@@ -1,5 +1,5 @@
 # muxbridge-e2e
-
+[![codecov](https://codecov.io/gh/define42/muxbridge-e2e/graph/badge.svg?token=C2WK7GLWU3)](https://codecov.io/gh/define42/muxbridge-e2e)
 `muxbridge-e2e` is a self-hosted SNI-routed TLS passthrough tunnel.
 
 For tunneled application hostnames, the public edge does not terminate TLS. It peeks the TLS ClientHello just far enough to extract SNI and ALPN, opens a yamux data stream to the matching client, and relays the raw encrypted TCP stream unchanged. The client owns certificates, completes TLS locally, and proxies the decrypted HTTP traffic to a local upstream.
