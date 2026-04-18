@@ -2,7 +2,7 @@
 
 `muxbridge-e2e` is a self-hosted SNI-routed TLS passthrough tunnel.
 
-It is built for the case where you want a public edge on the internet, but you do **not** want that edge to terminate TLS for your application hostnames. The edge reads only enough of the TLS ClientHello to extract SNI and ALPN, selects the right connected client, and forwards the raw encrypted TCP stream unchanged. The client owns the certificates, finishes the TLS handshake locally, and proxies the decrypted HTTP traffic to a local upstream.
+It is built for the case where you want a public edge on the internet, but you do **not** want that edge to terminate TLS for your application hostnames. The edge reads only enough of the TLS ClientHello to extract SNI and ALPN, selects the right connected client, and forwards the raw encrypted TCP stream unchanged. The client owns the certificates, finishes the TLS handshake locally, and proxies the decrypted HTTP traffic to a local origin.
 
 ## How It Works
 
@@ -14,7 +14,7 @@ Browser --TLS--> Edge Server (public)
              yamux data stream over
         persistent TLS control connection
                   v
-Client (private network) --local TLS termination--> Local upstream
+Client (private network) --local TLS termination--> Local origin
 ```
 
 You run an **edge** process on a public machine. Your **client** runs wherever the private application lives: behind NAT, behind a firewall, or on an internal network with no inbound port exposure.
@@ -26,7 +26,7 @@ When a browser connects to `https://demo.example.com`, the flow looks like this:
 1. The browser opens a normal TLS connection to the public edge.
 2. The edge reads only enough of the ClientHello to learn the requested hostname and ALPN.
 3. If that hostname belongs to a connected client, the edge opens a `yamux` data stream to that client and forwards the raw TCP bytes unchanged.
-4. The client treats that stream like a real `net.Conn`, completes the TLS handshake locally with its own certificate, and hands the decrypted HTTP traffic to the configured upstream route.
+4. The client treats that stream like a real `net.Conn`, completes the TLS handshake locally with its own certificate, and hands the decrypted HTTP traffic to the configured local origin from its `routes` map.
 5. The response travels back through the same path to the browser.
 
 That means the public edge makes the routing decision, but the private client owns the application TLS session.
@@ -60,10 +60,10 @@ This is not an HTTP-over-RPC tunnel. Public traffic is forwarded as raw TCP afte
 | | Cloudflare Tunnel | muxbridge-e2e |
 |---|---|---|
 | Control plane ownership | `cloudflared` connects to Cloudflare's network | client connects to your own self-hosted edge |
-| Browser request path | browser -> Cloudflare -> origin | browser -> your edge -> your client |
-| Browser-facing TLS for published HTTPS | Cloudflare handles a browser-to-Cloudflare connection, then a separate Cloudflare-to-origin connection | the edge peeks SNI and forwards the same raw TLS stream to the client |
-| End-to-end encryption model | Cloudflare documents two connections: one between the browser and Cloudflare, and another between Cloudflare and the origin | one browser-to-client TLS session is preserved through the edge, so app hostnames stay encrypted end to end |
-| Certificates for public app hostnames | Cloudflare serves the visitor-facing certificate at its edge; origin certs protect the Cloudflare-to-origin leg | the client owns the public-host certificate and private key |
+| Browser request path | browser -> Cloudflare -> local origin | browser -> your edge -> your client -> local origin |
+| Browser-facing TLS for published HTTPS | Cloudflare handles a browser-to-Cloudflare connection, then a separate Cloudflare-to-local-origin connection | the edge peeks SNI and forwards the same raw TLS stream to the client |
+| End-to-end encryption model | Cloudflare documents two connections: one between the browser and Cloudflare, and another between Cloudflare and the local origin | one browser-to-client TLS session is preserved through the edge, so app hostnames stay encrypted end to end |
+| Certificates for public app hostnames | Cloudflare serves the visitor-facing certificate at its edge; local origin certs protect the Cloudflare-to-local-origin leg | the client owns the public-host certificate and private key |
 | Private-side exposure | outbound-only connector, no inbound ports required | outbound-only client, no inbound ports required |
 | Transport to the private side | `cloudflared` establishes outbound connections to Cloudflare using HTTP/2 or QUIC | one outbound TLS connection to your edge with ALPN `muxbridge-control/1`, multiplexed with `yamux` |
 | Layer 7 edge features | Cloudflare applies CDN, WAF, DDoS protection, and related edge services in its network | edge intentionally does not inspect or terminate tunneled app TLS |
@@ -305,7 +305,7 @@ Incoming HTTP on `listen_http` is handled like this:
 
 ## Proxy Behavior
 
-After client-side TLS termination, requests are routed by exact hostname to local upstreams.
+After client-side TLS termination, requests are routed by exact hostname to local origins. In config terms, each local origin is the upstream URL attached to a hostname in the client's `routes` map.
 
 The reverse proxy preserves:
 
@@ -317,7 +317,7 @@ The reverse proxy preserves:
 - WebSocket upgrades
 - SSE
 
-For v1, local gRPC support is intended for `https://` upstreams so the upstream transport can use HTTP/2.
+For v1, local gRPC support is intended for `https://` local origins so the transport to the local origin can use HTTP/2.
 
 ## Metrics And Logs
 
@@ -374,7 +374,7 @@ The edge image exposes ports `80` and `443`. Both images include the example YAM
 The repo includes integration coverage for:
 
 - client registration and activation
-- HTTPS through the tunnel to a local upstream
+- HTTPS through the tunnel to a local origin
 - separate certificates for the edge domain and tunneled hostname
 - edge-domain TLS and status handlers on the shared `:443` listener
 - WebSocket echo through the tunnel
@@ -400,4 +400,4 @@ The repo includes integration coverage for:
 
 ## Summary
 
-`muxbridge-e2e` exists for the case where you want a self-hosted public ingress point without giving that ingress point ownership of your application TLS. The edge makes routing decisions from SNI, then gets out of the way. The client owns the keys, the certificates, the TLS handshake, and the local upstream relationship.
+`muxbridge-e2e` exists for the case where you want a self-hosted public ingress point without giving that ingress point ownership of your application TLS. The edge makes routing decisions from SNI, then gets out of the way. The client owns the keys, the certificates, the TLS handshake, and the local origin relationship.
