@@ -60,12 +60,12 @@ This is not an HTTP-over-RPC tunnel. Public traffic is forwarded as raw TCP afte
 | | Cloudflare Tunnel | muxbridge-e2e |
 |---|---|---|
 | Control plane ownership | `cloudflared` connects to Cloudflare's network | client connects to your own self-hosted edge |
-| Browser request path | browser -> Cloudflare -> local origin | browser -> your edge -> your client -> local origin |
+| Browser request path | browser -> Cloudflare -> `cloudflared` -> local origin | browser -> `muxbridge-e2e Edge` -> `muxbridge-e2e Client` -> local origin |
 | Browser-facing TLS for published HTTPS | Cloudflare handles a browser-to-Cloudflare connection, then a separate Cloudflare-to-local-origin connection | the edge peeks SNI and forwards the same raw TLS stream to the client |
 | End-to-end encryption model | Cloudflare documents two connections: one between the browser and Cloudflare, and another between Cloudflare and the local origin | one browser-to-client TLS session is preserved through the edge, so app hostnames stay encrypted end to end |
 | Certificates for public app hostnames | Cloudflare serves the visitor-facing certificate at its edge; local origin certs protect the Cloudflare-to-local-origin leg | the client owns the public-host certificate and private key |
 | Private-side exposure | outbound-only connector, no inbound ports required | outbound-only client, no inbound ports required |
-| Transport to the private side | `cloudflared` establishes outbound connections to Cloudflare using HTTP/2 or QUIC | one outbound TLS connection to your edge with ALPN `muxbridge-control/1`, multiplexed with `yamux` |
+| Transport to the private side | `cloudflared` establishes outbound connections to Cloudflare using HTTP/2 or QUIC | one outbound TLS connection from `muxbridge-e2e Client` to `muxbridge-e2e Edge` with ALPN `muxbridge-control/1`, multiplexed with `yamux` |
 | Layer 7 edge features | Cloudflare applies CDN, WAF, DDoS protection, and related edge services in its network | edge intentionally does not inspect or terminate tunneled app TLS |
 | Origin client IP model | for HTTP, Cloudflare documents `CF-Connecting-IP`; for non-HTTP protocols the original client IP is not available to the origin | the edge carries the remote address through the tunnel and the client proxy sets `X-Forwarded-For` |
 | Product focus | managed edge service with Cloudflare network features | self-hosted SNI-routed TLS passthrough with client-side certificate ownership |
