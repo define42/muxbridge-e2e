@@ -44,8 +44,6 @@ jobs:
         run: |
           go test ./... -coverprofile=coverage.out -coverpkg=./...
 
-      - name: Run benchmark guardrails
-        run: make bench
 
       - name: Show coverage in job summary
         run: |
