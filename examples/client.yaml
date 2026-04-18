@@ -1,0 +1,11 @@
+edge_addr: "edge.example.com:443"
+token: "demo-token"
+data_dir: "/var/lib/muxbridge-e2e-client"
+acme_email: "ops@example.com"
+
+reconnect_min: "1s"
+reconnect_max: "30s"
+
+routes:
+  demo.example.com: "http://127.0.0.1:8080"
+  api.demo.example.com: "http://127.0.0.1:9000"

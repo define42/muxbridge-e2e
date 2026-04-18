@@ -1,0 +1,19 @@
+public_domain: example.com
+edge_domain: edge.example.com
+listen_https: ":443"
+listen_http: ":80"
+data_dir: "/var/lib/muxbridge-e2e-edge"
+
+# Omit these to let the edge use CertMagic for edge_domain only.
+tls_cert_file: "/etc/muxbridge-e2e/edge.crt"
+tls_key_file: "/etc/muxbridge-e2e/edge.key"
+
+handshake_timeout: "5s"
+heartbeat_interval: "15s"
+heartbeat_timeout: "45s"
+replace_grace_period: "30s"
+
+client_credentials:
+  demo-token:
+    - demo.example.com
+    - api.demo.example.com

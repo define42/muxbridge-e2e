@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package control;
+
+option go_package = "muxbridge-e2e/proto;controlpb";
+
+message Envelope {
+  oneof message {
+    RegisterRequest register_request = 1;
+    RegisterResponse register_response = 2;
+    Heartbeat heartbeat = 3;
+    HeartbeatAck heartbeat_ack = 4;
+    DrainNotice drain_notice = 5;
+    Error error = 6;
+  }
+}
+
+message RegisterRequest {
+  string token = 1;
+  repeated string hostnames = 2;
+  string session_id = 3;
+}
+
+message RegisterResponse {
+  bool accepted = 1;
+  string message = 2;
+  repeated string hostnames = 3;
+  int64 heartbeat_interval_nanos = 4;
+  int64 heartbeat_timeout_nanos = 5;
+}
+
+message Heartbeat {
+  int64 unix_nano = 1;
+}
+
+message HeartbeatAck {
+  int64 unix_nano = 1;
+}
+
+enum DrainReason {
+  DRAIN_REASON_UNSPECIFIED = 0;
+  DRAIN_REASON_SESSION_REPLACED = 1;
+  DRAIN_REASON_SERVER_SHUTDOWN = 2;
+}
+
+message DrainNotice {
+  DrainReason reason = 1;
+  string message = 2;
+}
+
+message Error {
+  string message = 1;
+}
+
+message StreamHeader {
+  string hostname = 1;
+  string remote_addr = 2;
+  int64 accepted_at_unix_nano = 3;
+}
