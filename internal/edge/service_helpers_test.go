@@ -12,7 +12,6 @@ import (
 	"github.com/caddyserver/certmagic"
 	"github.com/hashicorp/yamux"
 	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 
 	"github.com/define42/muxbridge-e2e/internal/config"
 	"github.com/define42/muxbridge-e2e/internal/control"
@@ -459,13 +458,3 @@ type stubListener struct {
 func (l stubListener) Accept() (net.Conn, error) { return nil, context.Canceled }
 func (l stubListener) Close() error              { return nil }
 func (l stubListener) Addr() net.Addr            { return l.addr }
-
-func counterValue(t *testing.T, counter prometheus.Counter) float64 {
-	t.Helper()
-
-	metric := &dto.Metric{}
-	if err := counter.Write(metric); err != nil {
-		t.Fatalf("counter.Write() error = %v", err)
-	}
-	return metric.GetCounter().GetValue()
-}
