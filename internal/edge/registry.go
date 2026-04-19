@@ -1,6 +1,7 @@
 package edge
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,7 +25,10 @@ type clientSession struct {
 	draining      atomic.Bool
 	closed        chan struct{}
 	closeOnce     sync.Once
+	streamMu      sync.Mutex
 }
+
+var errSessionDraining = errors.New("session draining")
 
 type ioCloser interface {
 	Close() error
@@ -35,6 +39,13 @@ func (s *clientSession) Send(env *controlpb.Envelope) error {
 }
 
 func (s *clientSession) OpenStream() (*yamux.Stream, error) {
+	s.streamMu.Lock()
+	defer s.streamMu.Unlock()
+
+	if s.draining.Load() {
+		return nil, errSessionDraining
+	}
+
 	stream, err := s.mux.OpenStream()
 	if err != nil {
 		return nil, err
@@ -50,9 +61,15 @@ func (s *clientSession) FinishStream() {
 }
 
 func (s *clientSession) BeginDrain(reason controlpb.DrainReason, message string, grace time.Duration) {
-	if s.draining.Swap(true) {
+	s.streamMu.Lock()
+	if s.draining.Load() {
+		s.streamMu.Unlock()
 		return
 	}
+	s.draining.Store(true)
+	activeStreams := s.activeStreams.Load()
+	s.streamMu.Unlock()
+
 	_ = s.Send(&controlpb.Envelope{
 		Message: &controlpb.Envelope_DrainNotice{
 			DrainNotice: &controlpb.DrainNotice{
@@ -61,7 +78,7 @@ func (s *clientSession) BeginDrain(reason controlpb.DrainReason, message string,
 			},
 		},
 	})
-	if s.activeStreams.Load() == 0 || grace <= 0 {
+	if activeStreams == 0 || grace <= 0 {
 		s.Close()
 		return
 	}
@@ -122,7 +139,11 @@ func (r *sessionRegistry) activate(session *clientSession) (*clientSession, erro
 func (r *sessionRegistry) lookup(host string) *clientSession {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.byHost[host]
+	session := r.byHost[host]
+	if session != nil && session.draining.Load() {
+		return nil
+	}
+	return session
 }
 
 func (r *sessionRegistry) remove(session *clientSession) {

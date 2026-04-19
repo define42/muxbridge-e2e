@@ -2,6 +2,7 @@ package edge
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"slices"
 	"testing"
@@ -136,6 +137,12 @@ func TestClientSessionOpenStreamBeginDrainAndFinishStream(t *testing.T) {
 	session.BeginDrain(controlpb.DrainReason_DRAIN_REASON_SESSION_REPLACED, "newer session", time.Second)
 	if !session.draining.Load() {
 		t.Fatal("BeginDrain() did not mark session as draining")
+	}
+	if got := registry.lookup("demo.example.test"); got != nil {
+		t.Fatalf("lookup() during drain = %v, want nil", got)
+	}
+	if _, err := session.OpenStream(); !errors.Is(err, errSessionDraining) {
+		t.Fatalf("OpenStream() during drain error = %v, want %v", err, errSessionDraining)
 	}
 	session.FinishStream()
 
