@@ -110,6 +110,7 @@ type loadSummary struct {
 	RequestErrors       uint64
 	ResponseBytes       uint64
 	StatusCounts        map[int]uint64
+	ErrorCounts         map[string]uint64
 	MinLatency          time.Duration
 	MaxLatency          time.Duration
 	LatencySum          time.Duration
@@ -131,11 +132,11 @@ var (
 		}
 		return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	}
-	newPerfTLSConfig = newSelfSignedTLSConfig
-	waitForReadyFunc = waitForReady
+	newPerfTLSConfig         = newSelfSignedTLSConfig
+	waitForReadyFunc         = waitForReady
 	probeHTTP11KeepAliveFunc = probeHTTP11KeepAlive
-	runLoadFunc      = runLoad
-	printSummary     = func(summary string) {
+	runLoadFunc              = runLoad
+	printSummary             = func(summary string) {
 		fmt.Print(summary)
 	}
 )
@@ -719,6 +720,7 @@ func newLoadSummary(cfg loadRunConfig, startedAt time.Time) loadSummary {
 		PlannedDuration:  cfg.Duration,
 		StartedAt:        startedAt,
 		StatusCounts:     make(map[int]uint64),
+		ErrorCounts:      make(map[string]uint64),
 		LatencyHistogram: newLatencyHistogram(latencyBucketWidth, latencyBucketLimit),
 	}
 }
@@ -734,15 +736,16 @@ func (s *loadSummary) Record(result requestResult) {
 		s.MaxLatency = result.Latency
 	}
 
+	if result.Err != nil {
+		s.RequestErrors++
+		s.ErrorCounts[classifyRequestError(result.Err)]++
+		return
+	}
 	if result.StatusCode > 0 {
 		s.StatusCounts[result.StatusCode]++
 	}
 	if result.Bytes > 0 {
 		s.ResponseBytes += uint64(result.Bytes)
-	}
-	if result.Err != nil {
-		s.RequestErrors++
-		return
 	}
 	s.SuccessfulResponses++
 }
@@ -775,6 +778,9 @@ func (s loadSummary) String() string {
 	if len(s.StatusCounts) > 0 {
 		fmt.Fprintf(&b, "statuses: %s\n", formatStatusCounts(s.StatusCounts))
 	}
+	if len(s.ErrorCounts) > 0 {
+		fmt.Fprintf(&b, "error_kinds: %s\n", formatStringCounts(s.ErrorCounts))
+	}
 
 	return b.String()
 }
@@ -805,6 +811,52 @@ func formatStatusCounts(statusCounts map[int]uint64) string {
 		parts = append(parts, fmt.Sprintf("%d=%d", status, statusCounts[status]))
 	}
 	return strings.Join(parts, " ")
+}
+
+func formatStringCounts(counts map[string]uint64) string {
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", key, counts[key]))
+	}
+	return strings.Join(parts, " ")
+}
+
+func classifyRequestError(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	var netErr net.Error
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "eof"
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "timeout"
+	}
+
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "tls"):
+		return "tls"
+	case strings.Contains(msg, "connection reset"):
+		return "conn_reset"
+	case strings.Contains(msg, "broken pipe"):
+		return "broken_pipe"
+	case strings.Contains(msg, "refused"):
+		return "conn_refused"
+	default:
+		return "other"
+	}
 }
 
 func requestsPerSecond(total uint64, elapsed time.Duration) float64 {

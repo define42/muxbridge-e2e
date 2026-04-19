@@ -658,6 +658,59 @@ func TestRunLoadCountsRequestErrors(t *testing.T) {
 	}
 }
 
+func TestRunLoadDoesNotCountStatusOrBytesForBodyReadErrors(t *testing.T) {
+	t.Parallel()
+
+	scn, err := loadScenario("fast")
+	if err != nil {
+		t.Fatalf("loadScenario() error = %v", err)
+	}
+
+	summary, err := runLoad(context.Background(), loadRunConfig{
+		BaseURL:        "https://perf.example.com",
+		PublicHost:     "perf.example.com",
+		Scenario:       scn,
+		Connections:    1,
+		Duration:       20 * time.Millisecond,
+		RequestTimeout: 100 * time.Millisecond,
+	}, func(int) *http.Client {
+		return &http.Client{
+			Timeout: 100 * time.Millisecond,
+			Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: &errorReadCloser{
+						err:   io.ErrUnexpectedEOF,
+						first: []byte("partial"),
+					},
+				}, nil
+			}),
+		}
+	})
+	if err != nil {
+		t.Fatalf("runLoad() error = %v", err)
+	}
+
+	if summary.RequestErrors == 0 {
+		t.Fatal("RequestErrors = 0, want > 0")
+	}
+	if summary.SuccessfulResponses != 0 {
+		t.Fatalf("SuccessfulResponses = %d, want 0", summary.SuccessfulResponses)
+	}
+	if got := summary.StatusCounts[http.StatusOK]; got != 0 {
+		t.Fatalf("StatusCounts[200] = %d, want 0", got)
+	}
+	if summary.ResponseBytes != 0 {
+		t.Fatalf("ResponseBytes = %d, want 0", summary.ResponseBytes)
+	}
+	if summary.ErrorCounts["eof"] == 0 {
+		t.Fatalf("ErrorCounts[eof] = %d, want > 0", summary.ErrorCounts["eof"])
+	}
+	if !strings.Contains(summary.String(), "error_kinds: eof=") {
+		t.Fatalf("summary = %q, want eof error kinds", summary.String())
+	}
+}
+
 func TestRunLoadUsesConcurrentWorkers(t *testing.T) {
 	t.Parallel()
 
@@ -1163,6 +1216,22 @@ func TestLoadSummaryHelpers(t *testing.T) {
 	if got := histogram.Percentile(80); got != 10*time.Millisecond {
 		t.Fatalf("p80 = %s, want %s", got, 10*time.Millisecond)
 	}
+
+	if got := formatStringCounts(map[string]uint64{"timeout": 2, "eof": 1}); got != "eof=1 timeout=2" {
+		t.Fatalf("formatStringCounts() = %q, want %q", got, "eof=1 timeout=2")
+	}
+	if got := classifyRequestError(context.DeadlineExceeded); got != "timeout" {
+		t.Fatalf("classifyRequestError(timeout) = %q, want %q", got, "timeout")
+	}
+	if got := classifyRequestError(io.ErrUnexpectedEOF); got != "eof" {
+		t.Fatalf("classifyRequestError(eof) = %q, want %q", got, "eof")
+	}
+	if got := classifyRequestError(errors.New("connection reset by peer")); got != "conn_reset" {
+		t.Fatalf("classifyRequestError(conn_reset) = %q, want %q", got, "conn_reset")
+	}
+	if got := classifyRequestError(errors.New("boom")); got != "other" {
+		t.Fatalf("classifyRequestError(other) = %q, want %q", got, "other")
+	}
 }
 
 func TestWaitForClientExit(t *testing.T) {
@@ -1248,6 +1317,12 @@ func TestMainRejectsInvalidConfigInHelperProcess(t *testing.T) {
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
+type errorReadCloser struct {
+	err   error
+	first []byte
+	read  bool
+}
+
 type noFlushRecorder struct {
 	header http.Header
 	body   strings.Builder
@@ -1271,6 +1346,19 @@ func (r *noFlushRecorder) WriteHeader(statusCode int) {
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+func (r *errorReadCloser) Read(p []byte) (int, error) {
+	if !r.read {
+		r.read = true
+		n := copy(p, r.first)
+		return n, r.err
+	}
+	return 0, r.err
+}
+
+func (r *errorReadCloser) Close() error {
+	return nil
 }
 
 func newTestPublicClient(t *testing.T, server *httptest.Server, requestTimeout time.Duration) *http.Client {
