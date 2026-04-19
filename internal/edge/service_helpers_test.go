@@ -12,6 +12,7 @@ import (
 	"github.com/caddyserver/certmagic"
 	"github.com/hashicorp/yamux"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/define42/muxbridge-e2e/internal/config"
 	"github.com/define42/muxbridge-e2e/internal/control"
@@ -218,6 +219,40 @@ func TestRunControlLoopHeartbeatsAndUnexpectedMessage(t *testing.T) {
 		t.Fatalf("WriteEnvelope(unexpected) error = %v", err)
 	}
 	waitClosed(t, done)
+}
+
+func TestRunControlLoopTimesOutSilentPeer(t *testing.T) {
+	t.Parallel()
+
+	service := New(config.EdgeConfig{
+		HeartbeatInterval: config.Duration{Duration: 10 * time.Millisecond},
+		HeartbeatTimeout:  config.Duration{Duration: 30 * time.Millisecond},
+	}, Options{Registerer: prometheus.NewRegistry()})
+
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+
+	_, muxSession := newYamuxPair(t)
+	session := &clientSession{
+		id:            "session-timeout",
+		token:         "demo-token",
+		mux:           muxSession,
+		controlStream: serverConn,
+		controlWriter: control.NewLockedWriter(serverConn),
+		registry:      service.registry,
+		closed:        make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		service.runControlLoop(session, serverConn)
+		close(done)
+	}()
+
+	waitClosed(t, done)
+	if got := counterValue(t, service.metrics.HeartbeatsMissed); got != 1 {
+		t.Fatalf("HeartbeatsMissed = %v, want %d", got, 1)
+	}
 }
 
 func TestHandleControlConnRejectsInvalidRegistrations(t *testing.T) {
@@ -458,3 +493,13 @@ type stubListener struct {
 func (l stubListener) Accept() (net.Conn, error) { return nil, context.Canceled }
 func (l stubListener) Close() error              { return nil }
 func (l stubListener) Addr() net.Addr            { return l.addr }
+
+func counterValue(t *testing.T, counter prometheus.Counter) float64 {
+	t.Helper()
+
+	metric := &dto.Metric{}
+	if err := counter.Write(metric); err != nil {
+		t.Fatalf("counter.Write() error = %v", err)
+	}
+	return metric.GetCounter().GetValue()
+}

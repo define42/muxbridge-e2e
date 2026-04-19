@@ -15,7 +15,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -443,37 +442,20 @@ func (s *Service) handleControlConn(ctx context.Context, conn net.Conn) {
 func (s *Service) runControlLoop(session *clientSession, controlStream net.Conn) {
 	defer session.Close()
 
-	var lastHeartbeat atomic.Int64
-	lastHeartbeat.Store(time.Now().UnixNano())
-	ticker := time.NewTicker(s.cfg.HeartbeatInterval.Duration)
-	defer ticker.Stop()
-
-	heartbeatTimedOut := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				if time.Since(time.Unix(0, lastHeartbeat.Load())) > s.cfg.HeartbeatTimeout.Duration {
-					close(heartbeatTimedOut)
-					return
-				}
-			case <-session.closed:
-				return
-			}
-		}
-	}()
-
 	for {
-		select {
-		case <-heartbeatTimedOut:
-			s.metrics.HeartbeatsMissed.Inc()
-			s.logger.Warn("closing session after heartbeat timeout", "session_id", session.id, "token", session.token)
+		if err := controlStream.SetReadDeadline(time.Now().Add(s.cfg.HeartbeatTimeout.Duration)); err != nil {
+			s.logger.Debug("set control read deadline failed", "session_id", session.id, "error", err)
 			return
-		default:
 		}
 
 		env, err := control.ReadEnvelope(controlStream)
 		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				s.metrics.HeartbeatsMissed.Inc()
+				s.logger.Warn("closing session after heartbeat timeout", "session_id", session.id, "token", session.token)
+				return
+			}
 			if !errors.Is(err, io.EOF) {
 				s.logger.Debug("control stream closed", "session_id", session.id, "error", err)
 			}
@@ -482,7 +464,6 @@ func (s *Service) runControlLoop(session *clientSession, controlStream net.Conn)
 
 		switch msg := env.Message.(type) {
 		case *controlpb.Envelope_Heartbeat:
-			lastHeartbeat.Store(time.Now().UnixNano())
 			if err := session.Send(&controlpb.Envelope{
 				Message: &controlpb.Envelope_HeartbeatAck{
 					HeartbeatAck: &controlpb.HeartbeatAck{UnixNano: msg.Heartbeat.UnixNano},
