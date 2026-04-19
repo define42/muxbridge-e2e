@@ -21,7 +21,7 @@ import (
 
 	"github.com/define42/muxbridge-e2e/internal/config"
 	"github.com/define42/muxbridge-e2e/internal/control"
-	listenerpkg "github.com/define42/muxbridge-e2e/internal/listener"
+	muxpkg "github.com/define42/muxbridge-e2e/internal/mux"
 	"github.com/define42/muxbridge-e2e/internal/proxy"
 	"github.com/define42/muxbridge-e2e/internal/sni"
 	controlpb "github.com/define42/muxbridge-e2e/proto"
@@ -30,6 +30,7 @@ import (
 var errSessionReplaced = errors.New("session replaced by newer client")
 
 const yamuxMaxStreamWindowSize uint32 = 1 << 20
+const loopbackDialTimeout = 5 * time.Second
 
 type Options struct {
 	Logger              *slog.Logger
@@ -51,14 +52,16 @@ type Service struct {
 	manageSynchronously bool
 	handshakeObserver   func(sni.ClientHelloInfo)
 
-	rawListener *listenerpkg.QueueListener
-	httpServer  *http.Server
-	tlsConfig   *tls.Config
-	certManager *certmagic.Config
-	cancel      context.CancelFunc
-	done        chan struct{}
-	manageOnce  sync.Once
-	replaced    atomic.Bool
+	loopbackListener net.Listener
+	httpServer       *http.Server
+	tlsConfig        *tls.Config
+	certManager      *certmagic.Config
+	activeConnsMu    sync.Mutex
+	activeConns      map[net.Conn]struct{}
+	cancel           context.CancelFunc
+	done             chan struct{}
+	manageOnce       sync.Once
+	replaced         atomic.Bool
 }
 
 func New(cfg config.ClientConfig, opts Options) (*Service, error) {
@@ -94,7 +97,6 @@ func New(cfg config.ClientConfig, opts Options) (*Service, error) {
 	server := &http.Server{
 		Handler: handler,
 	}
-	rawListener := listenerpkg.NewQueueListener(&net.TCPAddr{IP: net.IPv4zero, Port: 0}, 256)
 
 	return &Service{
 		cfg:                 cfg,
@@ -104,7 +106,6 @@ func New(cfg config.ClientConfig, opts Options) (*Service, error) {
 		certIssuerFactory:   opts.CertIssuerFactory,
 		manageSynchronously: opts.ManageSynchronously,
 		handshakeObserver:   opts.HandshakeObserver,
-		rawListener:         rawListener,
 		httpServer:          server,
 		tlsConfig:           tlsConfig,
 		certManager:         certManager,
@@ -122,7 +123,14 @@ func (s *Service) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
-	tlsListener := tls.NewListener(s.rawListener, s.tlsConfig)
+	baseListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		cancel()
+		return fmt.Errorf("listen client loopback: %w", err)
+	}
+	s.loopbackListener = newLoopbackListener(baseListener, s.logger)
+
+	tlsListener := tls.NewListener(s.loopbackListener, s.tlsConfig)
 	go func() {
 		_ = s.httpServer.Serve(tlsListener)
 	}()
@@ -130,6 +138,12 @@ func (s *Service) Start(ctx context.Context) error {
 	if s.certManager != nil && s.manageSynchronously {
 		if err := s.ensureManagedSync(ctx); err != nil {
 			cancel()
+			if s.loopbackListener != nil {
+				_ = s.loopbackListener.Close()
+			}
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			_ = s.httpServer.Shutdown(shutdownCtx)
 			return err
 		}
 	}
@@ -149,7 +163,10 @@ func (s *Service) Close(ctx context.Context) error {
 	if s.cancel != nil {
 		s.cancel()
 	}
-	_ = s.rawListener.Close()
+	if s.loopbackListener != nil {
+		_ = s.loopbackListener.Close()
+	}
+	s.closeActiveConns()
 	if s.httpServer != nil {
 		_ = s.httpServer.Shutdown(ctx)
 	}
@@ -304,11 +321,18 @@ func (s *Service) handleDataStream(stream *yamux.Stream) {
 		}
 	}
 
-	conn = listenerpkg.WrapConn(conn, stream.LocalAddr(), parseRemoteAddr(header.RemoteAddr))
-	if err := s.rawListener.Inject(conn); err != nil {
-		s.logger.Warn("inject tunneled connection failed", "hostname", header.Hostname, "error", err)
+	loopbackConn, err := s.openLoopbackConn(header.RemoteAddr)
+	if err != nil {
+		s.logger.Warn("dial loopback connection failed", "hostname", header.Hostname, "error", err)
 		_ = conn.Close()
+		return
 	}
+	stopTrackingConn := s.trackActiveConn(conn)
+	defer stopTrackingConn()
+	stopTrackingLoopback := s.trackActiveConn(loopbackConn)
+	defer stopTrackingLoopback()
+
+	muxpkg.Relay(conn, loopbackConn)
 }
 
 func (s *Service) readControlLoop(controlStream net.Conn, lastAck *atomic.Int64, errs chan<- error) {
@@ -458,6 +482,60 @@ func newClientCertManager(dataDir, email string, customFactory func(*certmagic.C
 		})}
 	}
 	return manager
+}
+
+func (s *Service) openLoopbackConn(remoteAddr string) (net.Conn, error) {
+	if s.loopbackListener == nil {
+		return nil, errors.New("loopback listener not initialized")
+	}
+
+	conn, err := (&net.Dialer{Timeout: loopbackDialTimeout, KeepAlive: 30 * time.Second}).Dial("tcp", s.loopbackListener.Addr().String())
+	if err != nil {
+		return nil, err
+	}
+	if err := writeLoopbackPreface(conn, remoteAddr); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (s *Service) trackActiveConn(conn net.Conn) func() {
+	if conn == nil {
+		return func() {}
+	}
+
+	s.activeConnsMu.Lock()
+	if s.activeConns == nil {
+		s.activeConns = make(map[net.Conn]struct{})
+	}
+	s.activeConns[conn] = struct{}{}
+	s.activeConnsMu.Unlock()
+
+	return func() {
+		s.activeConnsMu.Lock()
+		delete(s.activeConns, conn)
+		s.activeConnsMu.Unlock()
+	}
+}
+
+func (s *Service) closeActiveConns() {
+	s.activeConnsMu.Lock()
+	if len(s.activeConns) == 0 {
+		s.activeConnsMu.Unlock()
+		return
+	}
+
+	conns := make([]net.Conn, 0, len(s.activeConns))
+	for conn := range s.activeConns {
+		conns = append(conns, conn)
+	}
+	s.activeConns = make(map[net.Conn]struct{})
+	s.activeConnsMu.Unlock()
+
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
 }
 
 func parseRemoteAddr(addr string) net.Addr {

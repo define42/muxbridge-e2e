@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"strings"
@@ -158,6 +159,52 @@ func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {
 		}
 		if !strings.Contains(got, "xff=") {
 			t.Fatalf("body = %q, want X-Forwarded-For", got)
+		}
+	})
+
+	t.Run("HTTPSKeepAliveReusesConnection", func(t *testing.T) {
+		transport := &http.Transport{
+			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}},
+			DialContext:       fixedDialer(actualHTTPSAddr),
+			ForceAttemptHTTP2: false,
+		}
+		t.Cleanup(transport.CloseIdleConnections)
+		client := &http.Client{Transport: transport}
+
+		var reused []bool
+		for i := 0; i < 2; i++ {
+			req, err := http.NewRequest(http.MethodGet, "https://"+demoDomain+"/headers", nil)
+			if err != nil {
+				t.Fatalf("NewRequest() error = %v", err)
+			}
+			trace := &httptrace.ClientTrace{
+				GotConn: func(info httptrace.GotConnInfo) {
+					reused = append(reused, info.Reused)
+				},
+			}
+			req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("request %d error = %v", i+1, err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			closeChecked(t, resp.Body)
+			if err != nil {
+				t.Fatalf("request %d ReadAll() error = %v", i+1, err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("request %d status = %d body=%q", i+1, resp.StatusCode, body)
+			}
+		}
+
+		if len(reused) != 2 {
+			t.Fatalf("GotConn calls = %d, want %d", len(reused), 2)
+		}
+		if reused[0] {
+			t.Fatal("first request unexpectedly reported a reused connection")
+		}
+		if !reused[1] {
+			t.Fatal("second request did not reuse the existing HTTP/1.1 connection")
 		}
 	})
 

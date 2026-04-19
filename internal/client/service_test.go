@@ -22,7 +22,6 @@ import (
 
 	"github.com/define42/muxbridge-e2e/internal/config"
 	"github.com/define42/muxbridge-e2e/internal/control"
-	listenerpkg "github.com/define42/muxbridge-e2e/internal/listener"
 	"github.com/define42/muxbridge-e2e/internal/sni"
 	controlpb "github.com/define42/muxbridge-e2e/proto"
 )
@@ -42,7 +41,7 @@ func TestNewUsesDefaultsAndHandlerOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if svc.logger == nil || svc.dialContext == nil || svc.rawListener == nil || svc.httpServer == nil {
+	if svc.logger == nil || svc.dialContext == nil || svc.httpServer == nil {
 		t.Fatal("New() did not initialize default dependencies")
 	}
 
@@ -455,15 +454,43 @@ func TestHeartbeatLoopReportsWriterError(t *testing.T) {
 func TestHandleDataStreamWithHandshakeObserver(t *testing.T) {
 	t.Parallel()
 
-	rawListener := listenerpkg.NewQueueListener(&net.TCPAddr{IP: net.IPv4zero, Port: 0}, 1)
 	var observed sni.ClientHelloInfo
+	baseListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	loopbackListener := newLoopbackListener(baseListener, slogDiscard())
+	defer func() { _ = loopbackListener.Close() }()
+
 	svc := &Service{
-		rawListener: rawListener,
+		loopbackListener: loopbackListener,
 		handshakeObserver: func(info sni.ClientHelloInfo) {
 			observed = info
 		},
 		logger: slogDiscard(),
 	}
+
+	type acceptedResult struct {
+		payload    []byte
+		remoteAddr string
+		err        error
+	}
+	resultCh := make(chan acceptedResult, 1)
+	go func() {
+		conn, err := loopbackListener.Accept()
+		if err != nil {
+			resultCh <- acceptedResult{err: err}
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		payload, err := io.ReadAll(conn)
+		resultCh <- acceptedResult{
+			payload:    payload,
+			remoteAddr: conn.RemoteAddr().String(),
+			err:        err,
+		}
+	}()
 
 	serverSession, clientSession := newYamuxPair(t)
 	accepted := make(chan *yamux.Stream, 1)
@@ -500,23 +527,17 @@ func TestHandleDataStreamWithHandshakeObserver(t *testing.T) {
 
 	svc.handleDataStream(serverStream)
 
-	conn, err := rawListener.Accept()
-	if err != nil {
-		t.Fatalf("Accept() error = %v", err)
+	result := <-resultCh
+	if result.err != nil {
+		t.Fatalf("loopback accept/read error = %v", result.err)
 	}
-	defer func() { _ = conn.Close() }()
-
-	got, err := io.ReadAll(conn)
-	if err != nil {
-		t.Fatalf("ReadAll() error = %v", err)
-	}
-	if !bytes.Equal(got, payload) {
+	if !bytes.Equal(result.payload, payload) {
 		t.Fatalf("replayed payload mismatch")
 	}
 	if observed.ServerName != "demo.example.test" {
 		t.Fatalf("observed.ServerName = %q, want %q", observed.ServerName, "demo.example.test")
 	}
-	if got := conn.RemoteAddr().String(); got != "192.0.2.20:443" {
+	if got := result.remoteAddr; got != "192.0.2.20:443" {
 		t.Fatalf("RemoteAddr() = %q, want %q", got, "192.0.2.20:443")
 	}
 }
@@ -524,11 +545,15 @@ func TestHandleDataStreamWithHandshakeObserver(t *testing.T) {
 func TestHandleDataStreamClosedListener(t *testing.T) {
 	t.Parallel()
 
-	rawListener := listenerpkg.NewQueueListener(&net.TCPAddr{IP: net.IPv4zero, Port: 0}, 1)
-	if err := rawListener.Close(); err != nil {
+	baseListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	loopbackListener := newLoopbackListener(baseListener, slogDiscard())
+	if err := loopbackListener.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	svc := &Service{rawListener: rawListener, logger: slogDiscard()}
+	svc := &Service{loopbackListener: loopbackListener, logger: slogDiscard()}
 
 	serverSession, clientSession := newYamuxPair(t)
 	accepted := make(chan *yamux.Stream, 1)
@@ -555,6 +580,109 @@ func TestHandleDataStreamClosedListener(t *testing.T) {
 	}()
 
 	svc.handleDataStream(serverStream)
+}
+
+func TestLoopbackListenerWrapsRemoteAddr(t *testing.T) {
+	t.Parallel()
+
+	baseListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	loopbackListener := newLoopbackListener(baseListener, slogDiscard())
+	defer func() { _ = loopbackListener.Close() }()
+
+	resultCh := make(chan struct {
+		payload    []byte
+		remoteAddr string
+		err        error
+	}, 1)
+	go func() {
+		conn, err := loopbackListener.Accept()
+		if err != nil {
+			resultCh <- struct {
+				payload    []byte
+				remoteAddr string
+				err        error
+			}{err: err}
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		payload, err := io.ReadAll(conn)
+		resultCh <- struct {
+			payload    []byte
+			remoteAddr string
+			err        error
+		}{
+			payload:    payload,
+			remoteAddr: conn.RemoteAddr().String(),
+			err:        err,
+		}
+	}()
+
+	conn, err := net.Dial("tcp", loopbackListener.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	if err := writeLoopbackPreface(conn, "192.0.2.30:443"); err != nil {
+		t.Fatalf("writeLoopbackPreface() error = %v", err)
+	}
+	if _, err := conn.Write([]byte("payload")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.CloseWrite()
+	} else {
+		_ = conn.Close()
+	}
+
+	result := <-resultCh
+	_ = conn.Close()
+	if result.err != nil {
+		t.Fatalf("loopback listener error = %v", result.err)
+	}
+	if !bytes.Equal(result.payload, []byte("payload")) {
+		t.Fatalf("payload = %q, want %q", result.payload, "payload")
+	}
+	if result.remoteAddr != "192.0.2.30:443" {
+		t.Fatalf("RemoteAddr() = %q, want %q", result.remoteAddr, "192.0.2.30:443")
+	}
+}
+
+func TestCloseClosesActiveConnections(t *testing.T) {
+	t.Parallel()
+
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+
+	done := make(chan struct{})
+	close(done)
+	svc := &Service{done: done}
+	stopTracking := svc.trackActiveConn(serverConn)
+	defer stopTracking()
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+	if err := svc.Close(closeCtx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		var buf [1]byte
+		_, err := clientConn.Read(buf[:])
+		readDone <- err
+	}()
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("clientConn.Read() error = nil, want closed connection")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("clientConn.Read() did not unblock after Close()")
+	}
 }
 
 func writeEnvelope(t *testing.T, conn net.Conn, env *controlpb.Envelope) {

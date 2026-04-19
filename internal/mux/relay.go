@@ -17,22 +17,28 @@ type closeWriter interface {
 
 func Relay(a, b net.Conn) RelayResult {
 	var result RelayResult
+	var closeOnce sync.Once
+	closeBoth := func() {
+		_ = a.Close()
+		_ = b.Close()
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
 		result.ClientToUpstream, _ = copyAndClose(b, a)
+		closeOnce.Do(closeBoth)
 	}()
 
 	go func() {
 		defer wg.Done()
 		result.UpstreamToClient, _ = copyAndClose(a, b)
+		closeOnce.Do(closeBoth)
 	}()
 
 	wg.Wait()
-	_ = a.Close()
-	_ = b.Close()
+	closeOnce.Do(closeBoth)
 	return result
 }
 

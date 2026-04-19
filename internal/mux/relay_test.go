@@ -62,6 +62,47 @@ func TestCopyAndCloseReturnsCopyError(t *testing.T) {
 	}
 }
 
+func TestRelayReturnsWhenOneSideClosesWhileOtherIsIdle(t *testing.T) {
+	t.Parallel()
+
+	clientSide, clientPeer := net.Pipe()
+	upstreamSide, upstreamPeer := net.Pipe()
+	defer func() { _ = clientPeer.Close() }()
+	defer func() { _ = upstreamPeer.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		Relay(clientSide, upstreamSide)
+		close(done)
+	}()
+
+	if err := upstreamPeer.Close(); err != nil {
+		t.Fatalf("upstreamPeer.Close() error = %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Relay() did not return after one side closed")
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		var buf [1]byte
+		_, err := clientPeer.Read(buf[:])
+		readDone <- err
+	}()
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("clientPeer.Read() error = nil, want closed connection")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("clientPeer.Read() did not unblock after Relay() returned")
+	}
+}
+
 type scriptConn struct {
 	reader io.Reader
 	writes bytes.Buffer
