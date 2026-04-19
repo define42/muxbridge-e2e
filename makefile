@@ -57,6 +57,7 @@ unit:
 integration:
 	go test ./internal/integration -v
 
+
 fmt:
 	gofmt -w $(GO_SOURCES)
 
