@@ -494,6 +494,9 @@ func TestHelpers(t *testing.T) {
 	if cfg.EnableKeepAlive {
 		t.Fatal("yamuxConfig().EnableKeepAlive = true, want false")
 	}
+	if cfg.MaxStreamWindowSize != yamuxMaxStreamWindowSize {
+		t.Fatalf("yamuxConfig().MaxStreamWindowSize = %d, want %d", cfg.MaxStreamWindowSize, yamuxMaxStreamWindowSize)
+	}
 
 	if got := uniqueStrings("h2", "http/1.1", "h2"); !slicesEqual(got, []string{"h2", "http/1.1"}) {
 		t.Fatalf("uniqueStrings() = %v, want %v", got, []string{"h2", "http/1.1"})

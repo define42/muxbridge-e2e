@@ -152,6 +152,9 @@ func TestBuildClientTLSConfigAndHelpers(t *testing.T) {
 	if cfg.EnableKeepAlive {
 		t.Fatal("yamuxConfig().EnableKeepAlive = true, want false")
 	}
+	if cfg.MaxStreamWindowSize != yamuxMaxStreamWindowSize {
+		t.Fatalf("yamuxConfig().MaxStreamWindowSize = %d, want %d", cfg.MaxStreamWindowSize, yamuxMaxStreamWindowSize)
+	}
 
 	if got := parseRemoteAddr("192.0.2.10:443").String(); got != "192.0.2.10:443" {
 		t.Fatalf("parseRemoteAddr(valid) = %q, want %q", got, "192.0.2.10:443")

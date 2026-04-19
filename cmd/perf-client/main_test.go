@@ -49,6 +49,7 @@ func resetPerfRunHooks(t *testing.T) {
 
 	origNewTunnel := newPerfTunnelClient
 	origWait := waitForReadyFunc
+	origProbe := probeHTTP11KeepAliveFunc
 	origRunLoad := runLoadFunc
 	origPrint := printSummary
 	origLogger := newPerfLogger
@@ -56,6 +57,7 @@ func resetPerfRunHooks(t *testing.T) {
 	t.Cleanup(func() {
 		newPerfTunnelClient = origNewTunnel
 		waitForReadyFunc = origWait
+		probeHTTP11KeepAliveFunc = origProbe
 		runLoadFunc = origRunLoad
 		printSummary = origPrint
 		newPerfLogger = origLogger
@@ -370,7 +372,7 @@ func TestNewSelfSignedTLSConfigAndPublicClientTrust(t *testing.T) {
 	transport = transport.Clone()
 	transport.DialContext = fixedDialer(server.Listener.Addr().String())
 
-	client := newPublicClient(500*time.Millisecond, rootCAs, transport)
+	client := newPublicClient(500*time.Millisecond, rootCAs, transport, false)
 	resp, err := client.Get("https://perf.example.com/healthz")
 	if err != nil {
 		t.Fatalf("GET /healthz error = %v", err)
@@ -454,6 +456,49 @@ func TestWaitForReadyReturnsRequestBuildError(t *testing.T) {
 	err := waitForReady(context.Background(), "://bad", &http.Client{}, 0, make(chan error))
 	if err == nil || !strings.Contains(err.Error(), "missing protocol scheme") {
 		t.Fatalf("waitForReady() error = %v, want request build failure", err)
+	}
+}
+
+func TestProbeHTTP11KeepAliveSuccess(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, "ok\n")
+	}))
+	defer server.Close()
+
+	ok, err := probeHTTP11KeepAlive(context.Background(), server.URL, newTestPublicClient(t, server, time.Second))
+	if err != nil {
+		t.Fatalf("probeHTTP11KeepAlive() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("probeHTTP11KeepAlive() = false, want true")
+	}
+}
+
+func TestProbeHTTP11KeepAliveDetectsClosedConnections(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Connection", "close")
+		_, _ = io.WriteString(w, "ok\n")
+	}))
+	defer server.Close()
+
+	ok, err := probeHTTP11KeepAlive(context.Background(), server.URL, newTestPublicClient(t, server, time.Second))
+	if err != nil {
+		t.Fatalf("probeHTTP11KeepAlive() error = %v", err)
+	}
+	if ok {
+		t.Fatal("probeHTTP11KeepAlive() = true, want false")
 	}
 }
 
@@ -674,7 +719,7 @@ func TestNewPublicClientDisablesHTTP2AndCapsConnections(t *testing.T) {
 		t.Fatalf("newPerfTLSConfigPool() error = %v", err)
 	}
 
-	client := newPublicClient(3*time.Second, rootCAs, nil)
+	client := newPublicClient(3*time.Second, rootCAs, nil, false)
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("Transport type = %T, want *http.Transport", client.Transport)
@@ -685,6 +730,9 @@ func TestNewPublicClientDisablesHTTP2AndCapsConnections(t *testing.T) {
 	}
 	if transport.ForceAttemptHTTP2 {
 		t.Fatal("ForceAttemptHTTP2 = true, want false")
+	}
+	if transport.DisableKeepAlives {
+		t.Fatal("DisableKeepAlives = true, want false")
 	}
 	if transport.MaxConnsPerHost != 1 {
 		t.Fatalf("MaxConnsPerHost = %d, want 1", transport.MaxConnsPerHost)
@@ -697,6 +745,9 @@ func TestNewPublicClientDisablesHTTP2AndCapsConnections(t *testing.T) {
 	}
 	if transport.TLSClientConfig == nil || transport.TLSClientConfig.RootCAs == nil {
 		t.Fatal("TLSClientConfig.RootCAs = nil, want trusted roots")
+	}
+	if transport.TLSClientConfig.ClientSessionCache == nil {
+		t.Fatal("TLSClientConfig.ClientSessionCache = nil, want TLS session resumption enabled")
 	}
 }
 
@@ -716,7 +767,7 @@ func TestNewPublicClientClonesProvidedTransport(t *testing.T) {
 		},
 	}
 
-	client := newPublicClient(2*time.Second, nil, transport)
+	client := newPublicClient(2*time.Second, nil, transport, true)
 	cloned, ok := client.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("Transport type = %T, want *http.Transport", client.Transport)
@@ -736,11 +787,17 @@ func TestNewPublicClientClonesProvidedTransport(t *testing.T) {
 	if cloned.ForceAttemptHTTP2 {
 		t.Fatal("ForceAttemptHTTP2 = true, want false")
 	}
+	if !cloned.DisableKeepAlives {
+		t.Fatal("DisableKeepAlives = false, want true")
+	}
 	if cloned.MaxIdleConns != 1 || cloned.MaxIdleConnsPerHost != 1 || cloned.MaxConnsPerHost != 1 {
 		t.Fatalf("connection caps = (%d, %d, %d), want (1, 1, 1)", cloned.MaxIdleConns, cloned.MaxIdleConnsPerHost, cloned.MaxConnsPerHost)
 	}
 	if len(cloned.TLSNextProto) != 0 {
 		t.Fatalf("TLSNextProto length = %d, want 0", len(cloned.TLSNextProto))
+	}
+	if cloned.TLSClientConfig == nil || cloned.TLSClientConfig.ClientSessionCache == nil {
+		t.Fatal("TLSClientConfig.ClientSessionCache = nil, want TLS session resumption enabled")
 	}
 }
 
@@ -809,14 +866,25 @@ func TestRunSuccessUsesTunnelAndLoadRunner(t *testing.T) {
 		waitedBaseURL = baseURL
 		return nil
 	}
+	probeHTTP11KeepAliveFunc = func(context.Context, string, *http.Client) (bool, error) {
+		return true, nil
+	}
 
 	var loadCfg loadRunConfig
 	runLoadFunc = func(ctx context.Context, cfg loadRunConfig, clientFactory func(int) *http.Client) (loadSummary, error) {
 		if clientFactory == nil {
 			t.Fatal("clientFactory = nil")
 		}
-		if got := clientFactory(0); got == nil {
+		got := clientFactory(0)
+		if got == nil {
 			t.Fatal("clientFactory returned nil client")
+		}
+		transport, ok := got.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("client transport type = %T, want *http.Transport", got.Transport)
+		}
+		if transport.DisableKeepAlives {
+			t.Fatal("DisableKeepAlives = true, want false when keepalive probe succeeds")
 		}
 		loadCfg = cfg
 		return loadSummary{
@@ -890,6 +958,57 @@ func TestRunSuccessUsesTunnelAndLoadRunner(t *testing.T) {
 	}
 }
 
+func TestRunDisablesKeepAlivesWhenProbeFails(t *testing.T) {
+	resetPerfRunHooks(t)
+
+	newPerfLogger = func(bool) *slog.Logger {
+		return slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	newPerfTunnelClient = func(tunnel.Config) (perfTunnelClient, error) {
+		return &stubPerfTunnelClient{
+			runFunc: func(ctx context.Context) error {
+				<-ctx.Done()
+				return nil
+			},
+		}, nil
+	}
+	waitForReadyFunc = func(context.Context, string, *http.Client, time.Duration, <-chan error) error {
+		return nil
+	}
+	probeHTTP11KeepAliveFunc = func(context.Context, string, *http.Client) (bool, error) {
+		return false, nil
+	}
+	runLoadFunc = func(_ context.Context, _ loadRunConfig, clientFactory func(int) *http.Client) (loadSummary, error) {
+		client := clientFactory(0)
+		transport, ok := client.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("client transport type = %T, want *http.Transport", client.Transport)
+		}
+		if !transport.DisableKeepAlives {
+			t.Fatal("DisableKeepAlives = false, want true after failed keepalive probe")
+		}
+		return loadSummary{
+			PublicHost:      "perf.example.com",
+			Scenario:        "fast",
+			Connections:     1,
+			PlannedDuration: time.Second,
+			StartedAt:       time.Unix(0, 0),
+			EndedAt:         time.Unix(0, int64(time.Second)),
+			StatusCounts:    map[int]uint64{http.StatusOK: 1},
+		}, nil
+	}
+	printSummary = func(string) {}
+
+	err := run(context.Background(), []string{
+		"--public-host", "perf.example.com",
+		"--public-domain", "example.com",
+		"--edge-addr", "edge.example.com:443",
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+}
+
 func TestRunReturnsLoadErrorAndStopsTunnel(t *testing.T) {
 	resetPerfRunHooks(t)
 
@@ -908,6 +1027,9 @@ func TestRunReturnsLoadErrorAndStopsTunnel(t *testing.T) {
 	}
 	waitForReadyFunc = func(context.Context, string, *http.Client, time.Duration, <-chan error) error {
 		return nil
+	}
+	probeHTTP11KeepAliveFunc = func(context.Context, string, *http.Client) (bool, error) {
+		return true, nil
 	}
 	runLoadFunc = func(context.Context, loadRunConfig, func(int) *http.Client) (loadSummary, error) {
 		return loadSummary{}, errors.New("load boom")
@@ -949,6 +1071,10 @@ func TestRunReturnsReadinessErrorAndStopsTunnel(t *testing.T) {
 	}
 	waitForReadyFunc = func(context.Context, string, *http.Client, time.Duration, <-chan error) error {
 		return errors.New("not ready")
+	}
+	probeHTTP11KeepAliveFunc = func(context.Context, string, *http.Client) (bool, error) {
+		t.Fatal("probeHTTP11KeepAlive should not be called on readiness failure")
+		return false, nil
 	}
 	runLoadFunc = func(context.Context, loadRunConfig, func(int) *http.Client) (loadSummary, error) {
 		t.Fatal("runLoad should not be called on readiness failure")
@@ -1156,7 +1282,7 @@ func newTestPublicClient(t *testing.T, server *httptest.Server, requestTimeout t
 		t.Fatalf("server transport type = %T, want *http.Transport", baseClient.Transport)
 	}
 
-	return newPublicClient(requestTimeout, nil, transport)
+	return newPublicClient(requestTimeout, nil, transport, false)
 }
 
 func fixedDialer(target string) func(context.Context, string, string) (net.Conn, error) {

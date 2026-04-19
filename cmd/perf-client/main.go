@@ -20,6 +20,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"os/signal"
 	"sort"
@@ -132,6 +133,7 @@ var (
 	}
 	newPerfTLSConfig = newSelfSignedTLSConfig
 	waitForReadyFunc = waitForReady
+	probeHTTP11KeepAliveFunc = probeHTTP11KeepAlive
 	runLoadFunc      = runLoad
 	printSummary     = func(summary string) {
 		fmt.Print(summary)
@@ -200,13 +202,28 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	readyCtx, readyCancel := context.WithTimeout(runCtx, cfg.ReadyTimeout)
 	defer readyCancel()
 
-	readyClient := newPublicClient(cfg.RequestTimeout, rootCAs, nil)
+	readyClient := newPublicClient(cfg.RequestTimeout, rootCAs, nil, false)
 	if err := waitForReadyFunc(readyCtx, cfg.publicBaseURL(), readyClient, defaultReadyPollPeriod, tunnelErrCh); err != nil {
 		cancel()
 		if tunnelErr := waitForClientExit(tunnelErrCh, 2*time.Second); tunnelErr != nil && cfg.Debug {
 			logger.Debug("perf tunnel exited during readiness failure", "error", tunnelErr)
 		}
 		return fmt.Errorf("public host %s did not become ready: %w", cfg.PublicHost, err)
+	}
+	closeIdleConnections(readyClient)
+
+	disableKeepAlives := false
+	probeCtx, probeCancel := context.WithTimeout(runCtx, cfg.RequestTimeout)
+	defer probeCancel()
+	probeClient := newPublicClient(cfg.RequestTimeout, rootCAs, nil, false)
+	keepAliveOK, probeErr := probeHTTP11KeepAliveFunc(probeCtx, cfg.publicBaseURL(), probeClient)
+	closeIdleConnections(probeClient)
+	if probeErr != nil && cfg.Debug {
+		logger.Debug("http/1.1 keepalive probe failed", "error", probeErr)
+	}
+	if !keepAliveOK {
+		disableKeepAlives = true
+		logger.Warn("public HTTP/1.1 keepalive probe failed; falling back to fresh connections per request")
 	}
 
 	summary, err := runLoadFunc(runCtx, loadRunConfig{
@@ -217,7 +234,7 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 		Duration:       cfg.Duration,
 		RequestTimeout: cfg.RequestTimeout,
 	}, func(int) *http.Client {
-		return newPublicClient(cfg.RequestTimeout, rootCAs, nil)
+		return newPublicClient(cfg.RequestTimeout, rootCAs, nil, disableKeepAlives)
 	})
 
 	cancel()
@@ -584,12 +601,49 @@ func doRequest(ctx context.Context, client *http.Client, targetURL string) reque
 	}
 }
 
-func newPublicClient(requestTimeout time.Duration, rootCAs *x509.CertPool, transport *http.Transport) *http.Client {
+func probeHTTP11KeepAlive(ctx context.Context, baseURL string, client *http.Client) (bool, error) {
+	if client == nil {
+		return false, errors.New("nil public client")
+	}
+
+	target := strings.TrimRight(baseURL, "/") + "/healthz"
+	reused := make([]bool, 0, 2)
+	for i := 0; i < 2; i++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return false, err
+		}
+		trace := &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				reused = append(reused, info.Reused)
+			},
+		}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return false, err
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return false, readErr
+		}
+		if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != "ok" {
+			return false, fmt.Errorf("keepalive probe status=%d body=%q", resp.StatusCode, body)
+		}
+	}
+
+	return len(reused) == 2 && !reused[0] && reused[1], nil
+}
+
+func newPublicClient(requestTimeout time.Duration, rootCAs *x509.CertPool, transport *http.Transport, disableKeepAlives bool) *http.Client {
 	if transport == nil {
-		transport = newHTTP11Transport(requestTimeout, rootCAs)
+		transport = newHTTP11Transport(requestTimeout, rootCAs, disableKeepAlives)
 	} else {
 		transport = transport.Clone()
 		transport.ForceAttemptHTTP2 = false
+		transport.DisableKeepAlives = disableKeepAlives
 		transport.MaxIdleConns = 1
 		transport.MaxIdleConnsPerHost = 1
 		transport.MaxConnsPerHost = 1
@@ -614,6 +668,9 @@ func newPublicClient(requestTimeout time.Duration, rootCAs *x509.CertPool, trans
 		if transport.TLSClientConfig.MinVersion == 0 {
 			transport.TLSClientConfig.MinVersion = tls.VersionTLS12
 		}
+		if transport.TLSClientConfig.ClientSessionCache == nil {
+			transport.TLSClientConfig.ClientSessionCache = tls.NewLRUClientSessionCache(1)
+		}
 	}
 
 	return &http.Client{
@@ -622,11 +679,12 @@ func newPublicClient(requestTimeout time.Duration, rootCAs *x509.CertPool, trans
 	}
 }
 
-func newHTTP11Transport(requestTimeout time.Duration, rootCAs *x509.CertPool) *http.Transport {
+func newHTTP11Transport(requestTimeout time.Duration, rootCAs *x509.CertPool, disableKeepAlives bool) *http.Transport {
 	return &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: requestTimeout, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     false,
+		DisableKeepAlives:     disableKeepAlives,
 		MaxIdleConns:          1,
 		MaxIdleConnsPerHost:   1,
 		MaxConnsPerHost:       1,
@@ -636,8 +694,9 @@ func newHTTP11Transport(requestTimeout time.Duration, rootCAs *x509.CertPool) *h
 		ExpectContinueTimeout: time.Second,
 		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
 		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			RootCAs:    rootCAs,
+			MinVersion:         tls.VersionTLS12,
+			RootCAs:            rootCAs,
+			ClientSessionCache: tls.NewLRUClientSessionCache(1),
 		},
 	}
 }

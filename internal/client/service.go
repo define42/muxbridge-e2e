@@ -29,6 +29,8 @@ import (
 
 var errSessionReplaced = errors.New("session replaced by newer client")
 
+const yamuxMaxStreamWindowSize uint32 = 1 << 20
+
 type Options struct {
 	Logger              *slog.Logger
 	DialContext         func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -413,6 +415,7 @@ func (s *Service) buildControlTLSConfig() *tls.Config {
 func (s *Service) yamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = false
+	cfg.MaxStreamWindowSize = yamuxMaxStreamWindowSize
 	return cfg
 }
 

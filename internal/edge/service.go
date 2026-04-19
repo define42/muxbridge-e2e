@@ -33,6 +33,7 @@ import (
 )
 
 const maxClientHelloBytes = 64 << 10
+const yamuxMaxStreamWindowSize uint32 = 1 << 20
 
 type Options struct {
 	Logger              *slog.Logger
@@ -637,6 +638,7 @@ func newCertManager(storageDir string, customFactory func(*certmagic.Config) cer
 func (s *Service) yamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = false
+	cfg.MaxStreamWindowSize = yamuxMaxStreamWindowSize
 	return cfg
 }
 
