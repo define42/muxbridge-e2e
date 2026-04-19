@@ -11,24 +11,35 @@ type QueueListener struct {
 	conns  chan net.Conn
 	closed chan struct{}
 	once   sync.Once
+
+	mu            sync.Mutex
+	activeInjects int
+	injectCond    *sync.Cond
 }
 
 func NewQueueListener(addr net.Addr, size int) *QueueListener {
 	if size <= 0 {
 		size = 128
 	}
-	return &QueueListener{
+	l := &QueueListener{
 		addr:   addr,
 		conns:  make(chan net.Conn, size),
 		closed: make(chan struct{}),
 	}
+	l.injectCond = sync.NewCond(&l.mu)
+	return l
 }
 
 func (l *QueueListener) Accept() (net.Conn, error) {
 	select {
-	case conn, ok := <-l.conns:
-		if !ok {
+	case conn := <-l.conns:
+		select {
+		case <-l.closed:
+			if conn != nil {
+				_ = conn.Close()
+			}
 			return nil, net.ErrClosed
+		default:
 		}
 		return conn, nil
 	case <-l.closed:
@@ -37,6 +48,18 @@ func (l *QueueListener) Accept() (net.Conn, error) {
 }
 
 func (l *QueueListener) Inject(conn net.Conn) error {
+	l.mu.Lock()
+	l.activeInjects++
+	l.mu.Unlock()
+	defer func() {
+		l.mu.Lock()
+		l.activeInjects--
+		if l.activeInjects == 0 {
+			l.injectCond.Broadcast()
+		}
+		l.mu.Unlock()
+	}()
+
 	select {
 	case <-l.closed:
 		if conn != nil {
@@ -48,6 +71,14 @@ func (l *QueueListener) Inject(conn net.Conn) error {
 
 	select {
 	case l.conns <- conn:
+		select {
+		case <-l.closed:
+			if conn != nil {
+				_ = conn.Close()
+			}
+			return net.ErrClosed
+		default:
+		}
 		return nil
 	case <-l.closed:
 		if conn != nil {
@@ -60,7 +91,23 @@ func (l *QueueListener) Inject(conn net.Conn) error {
 func (l *QueueListener) Close() error {
 	l.once.Do(func() {
 		close(l.closed)
-		close(l.conns)
+
+		l.mu.Lock()
+		for l.activeInjects > 0 {
+			l.injectCond.Wait()
+		}
+		l.mu.Unlock()
+
+		for {
+			select {
+			case conn := <-l.conns:
+				if conn != nil {
+					_ = conn.Close()
+				}
+			default:
+				return
+			}
+		}
 	})
 	return nil
 }

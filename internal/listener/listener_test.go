@@ -64,6 +64,83 @@ func TestQueueListenerInjectIntoClosedListenerClosesConn(t *testing.T) {
 	}
 }
 
+func TestQueueListenerCloseDrainsQueuedConnections(t *testing.T) {
+	t.Parallel()
+
+	l := NewQueueListener(&net.TCPAddr{Port: 80}, 2)
+	first := &stubConn{}
+	second := &stubConn{}
+
+	if err := l.Inject(first); err != nil {
+		t.Fatalf("Inject(first) error = %v", err)
+	}
+	if err := l.Inject(second); err != nil {
+		t.Fatalf("Inject(second) error = %v", err)
+	}
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := first.closeCalls.Load(); got != 1 {
+		t.Fatalf("first Close() calls = %d, want %d", got, 1)
+	}
+	if got := second.closeCalls.Load(); got != 1 {
+		t.Fatalf("second Close() calls = %d, want %d", got, 1)
+	}
+	if _, err := l.Accept(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Accept() after Close() error = %v, want %v", err, net.ErrClosed)
+	}
+}
+
+func TestQueueListenerConcurrentCloseAndInjectDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	for i := 0; i < 200; i++ {
+		l := NewQueueListener(&net.TCPAddr{Port: 80}, 1)
+		conn := &stubConn{}
+
+		start := make(chan struct{})
+		panicCh := make(chan any, 1)
+		errCh := make(chan error, 1)
+		closeDone := make(chan struct{})
+
+		go func() {
+			defer close(closeDone)
+			<-start
+			_ = l.Close()
+		}()
+
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panicCh <- r
+				}
+			}()
+			<-start
+			errCh <- l.Inject(conn)
+		}()
+
+		close(start)
+
+		select {
+		case p := <-panicCh:
+			t.Fatalf("Inject() panicked during concurrent Close(): %v", p)
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("Inject() error = %v, want nil or %v", err, net.ErrClosed)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for Inject()")
+		}
+
+		select {
+		case <-closeDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for Close()")
+		}
+	}
+}
+
 func TestWrapConnUsesOverrideAddrs(t *testing.T) {
 	t.Parallel()
 
