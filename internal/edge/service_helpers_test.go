@@ -2,6 +2,8 @@ package edge
 
 import (
 	"context"
+	"crypto/x509"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -474,6 +476,45 @@ func TestNewCertManagerUsesCustomFactory(t *testing.T) {
 	}
 }
 
+func TestStartCleansUpServersWhenCertificateManagementFails(t *testing.T) {
+	t.Parallel()
+
+	issueErr := errors.New("issuer failed")
+	service := New(config.EdgeConfig{
+		DataDir:     t.TempDir(),
+		EdgeDomain:  "edge.example.test",
+		ListenHTTPS: "127.0.0.1:0",
+		ListenHTTP:  "127.0.0.1:0",
+	}, Options{
+		Registerer: prometheus.NewRegistry(),
+		CertIssuerFactory: func(*certmagic.Config) certmagic.Issuer {
+			return failingIssuer{err: issueErr}
+		},
+		ManageSynchronously: true,
+	})
+
+	err := service.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start() error = nil, want certificate management failure")
+	}
+	if !strings.Contains(err.Error(), "manage edge certificates") {
+		t.Fatalf("Start() error = %v, want manage edge certificates", err)
+	}
+	if !strings.Contains(err.Error(), issueErr.Error()) {
+		t.Fatalf("Start() error = %v, want wrapped issuer error", err)
+	}
+
+	assertAcceptReturnsClosed(t, service.edgeHTTPListener)
+	assertDialFails(t, service.HTTPSAddr())
+	assertDialFails(t, service.HTTPAddr())
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := service.Close(closeCtx); err != nil {
+		t.Fatalf("Close() after failed Start = %v", err)
+	}
+}
+
 func slicesEqual(got, want []string) bool {
 	if len(got) != len(want) {
 		return false
@@ -494,6 +535,18 @@ func (l stubListener) Accept() (net.Conn, error) { return nil, context.Canceled 
 func (l stubListener) Close() error              { return nil }
 func (l stubListener) Addr() net.Addr            { return l.addr }
 
+type failingIssuer struct {
+	err error
+}
+
+func (f failingIssuer) Issue(context.Context, *x509.CertificateRequest) (*certmagic.IssuedCertificate, error) {
+	return nil, f.err
+}
+
+func (f failingIssuer) IssuerKey() string {
+	return "failing-issuer"
+}
+
 func counterValue(t *testing.T, counter prometheus.Counter) float64 {
 	t.Helper()
 
@@ -502,4 +555,35 @@ func counterValue(t *testing.T, counter prometheus.Counter) float64 {
 		t.Fatalf("counter.Write() error = %v", err)
 	}
 	return metric.GetCounter().GetValue()
+}
+
+func assertAcceptReturnsClosed(t *testing.T, ln interface {
+	Accept() (net.Conn, error)
+}) {
+	t.Helper()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ln.Accept()
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Accept() error = %v, want %v", err, net.ErrClosed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Accept() did not unblock after failed Start cleanup")
+	}
+}
+
+func assertDialFails(t *testing.T, addr string) {
+	t.Helper()
+
+	conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatalf("DialTimeout(%q) succeeded, listener is still open", addr)
+	}
 }

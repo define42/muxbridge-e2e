@@ -156,20 +156,27 @@ func (s *Service) Start(ctx context.Context) error {
 		hosts := []string{s.cfg.EdgeDomain}
 		if s.manageSync {
 			if err := s.certManager.ManageSync(ctx, hosts); err != nil {
-				cancel()
-				_ = s.closeListeners()
+				s.cleanupFailedStart(err)
 				return fmt.Errorf("manage edge certificates: %w", err)
 			}
 		} else {
 			if err := s.certManager.ManageAsync(ctx, hosts); err != nil {
-				cancel()
-				_ = s.closeListeners()
+				s.cleanupFailedStart(err)
 				return fmt.Errorf("manage edge certificates: %w", err)
 			}
 		}
 	}
 
 	return nil
+}
+
+func (s *Service) cleanupFailedStart(cause error) {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := s.Close(cleanupCtx); err != nil {
+		s.logger.Warn("failed to clean up edge service after start error", "error", err, "cause", cause)
+	}
 }
 
 func (s *Service) Close(ctx context.Context) error {
