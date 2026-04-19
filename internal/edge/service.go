@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"slices"
 	"strings"
@@ -508,26 +509,44 @@ func (s *Service) authorizeRegistration(req *controlpb.RegisterRequest) ([]strin
 }
 
 func (s *Service) edgeHTTPHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
+	statusHandler := s.edgeStatusHandler()
+	if !s.cfg.Debug {
+		return statusHandler
+	}
+
+	pprofHandler := newPprofHandler()
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if isPprofPath(req.URL.Path) {
+			pprofHandler.ServeHTTP(w, req)
+			return
+		}
+		statusHandler.ServeHTTP(w, req)
 	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ready\n"))
+}
+
+func (s *Service) edgeStatusHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/healthz":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+		case "/readyz":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready\n"))
+		case "/metrics":
+			s.metricsHandler.ServeHTTP(w, req)
+		case "/":
+			snapshot := s.registry.snapshot()
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = fmt.Fprintf(w, "muxbridge-e2e edge\nactive_sessions: %d\nhostnames: %s\n", snapshot.ActiveSessions, strings.Join(snapshot.Hostnames, ","))
+		default:
+			http.NotFound(w, req)
+		}
 	})
-	mux.Handle("/metrics", s.metricsHandler)
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		snapshot := s.registry.snapshot()
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = fmt.Fprintf(w, "muxbridge-e2e edge\nactive_sessions: %d\nhostnames: %s\n", snapshot.ActiveSessions, strings.Join(snapshot.Hostnames, ","))
-	})
-	return mux
 }
 
 func (s *Service) publicHTTPHandler() http.Handler {
-	statusHandler := s.edgeHTTPHandler()
+	statusHandler := s.edgeStatusHandler()
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if strings.EqualFold(stripPort(req.Host), s.cfg.EdgeDomain) {
 			statusHandler.ServeHTTP(w, req)
@@ -563,6 +582,36 @@ func (s *Service) buildTLSConfig() (*tls.Config, *certmagic.Config, error) {
 	tlsConfig := manager.TLSConfig()
 	tlsConfig.NextProtos = uniqueStrings(append([]string{control.ALPNControl, "h2", "http/1.1"}, tlsConfig.NextProtos...)...)
 	return tlsConfig, manager, nil
+}
+
+func isPprofPath(path string) bool {
+	return path == "/pprof" || path == "/pprof/" || strings.HasPrefix(path, "/pprof/")
+}
+
+func newPprofHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/pprof" {
+			target := *req.URL
+			target.Path = "/pprof/"
+			http.Redirect(w, req, target.String(), http.StatusPermanentRedirect)
+			return
+		}
+
+		rewritten := req.Clone(req.Context())
+		suffix := strings.TrimPrefix(req.URL.Path, "/pprof")
+		if suffix == "" {
+			suffix = "/"
+		}
+		rewritten.URL.Path = "/debug/pprof" + suffix
+		mux.ServeHTTP(w, rewritten)
+	})
 }
 
 func newCertManager(storageDir string, customFactory func(*certmagic.Config) certmagic.Issuer, defaultFactory func(*certmagic.Config) certmagic.Issuer) *certmagic.Config {

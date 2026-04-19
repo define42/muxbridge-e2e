@@ -48,6 +48,7 @@ type EdgeConfig struct {
 	AcmeEmail          string              `yaml:"acme_email"`
 	TLSCertFile        string              `yaml:"tls_cert_file"`
 	TLSKeyFile         string              `yaml:"tls_key_file"`
+	Debug              bool                `yaml:"debug"`
 	ClientCredentials  map[string][]string `yaml:"client_credentials"`
 	HandshakeTimeout   Duration            `yaml:"handshake_timeout"`
 	HeartbeatInterval  Duration            `yaml:"heartbeat_interval"`

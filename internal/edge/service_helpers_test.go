@@ -115,6 +115,13 @@ func TestEdgeHTTPHandlerAndPublicHTTPHandler(t *testing.T) {
 			wantBody:   "ready\n",
 		},
 		{
+			name:       "pprof disabled on https",
+			handler:    service.edgeHTTPHandler(),
+			target:     "http://edge.example.test/pprof/heap",
+			host:       "edge.example.test",
+			wantStatus: http.StatusNotFound,
+		},
+		{
 			name:       "public redirect",
 			handler:    service.publicHTTPHandler(),
 			target:     "http://demo.example.test/path?q=1",
@@ -166,6 +173,71 @@ func TestEdgeHTTPHandlerAndPublicHTTPHandler(t *testing.T) {
 	}
 	if got := service.HTTPAddr(); got != "127.0.0.1:8080" {
 		t.Fatalf("HTTPAddr() = %q, want %q", got, "127.0.0.1:8080")
+	}
+}
+
+func TestEdgeHTTPHandlerServesPprofWhenDebugEnabled(t *testing.T) {
+	t.Parallel()
+
+	service := New(config.EdgeConfig{
+		EdgeDomain: "edge.example.test",
+		Debug:      true,
+	}, Options{Registerer: prometheus.NewRegistry()})
+
+	httpsHandler := service.edgeHTTPHandler()
+	tests := []struct {
+		name         string
+		target       string
+		wantStatus   int
+		wantLocation string
+	}{
+		{
+			name:         "redirect root",
+			target:       "https://edge.example.test/pprof?debug=1",
+			wantStatus:   http.StatusPermanentRedirect,
+			wantLocation: "https://edge.example.test/pprof/?debug=1",
+		},
+		{
+			name:       "index",
+			target:     "https://edge.example.test/pprof/",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "heap",
+			target:     "https://edge.example.test/pprof/heap",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "cmdline",
+			target:     "https://edge.example.test/pprof/cmdline",
+			wantStatus: http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.target, nil)
+			req.Host = "edge.example.test"
+			rec := httptest.NewRecorder()
+			httpsHandler.ServeHTTP(rec, req)
+
+			if rec.Result().StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Result().StatusCode, tt.wantStatus)
+			}
+			if tt.wantLocation != "" {
+				if got := rec.Result().Header.Get("Location"); got != tt.wantLocation {
+					t.Fatalf("Location = %q, want %q", got, tt.wantLocation)
+				}
+			}
+		})
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://edge.example.test/pprof/heap", nil)
+	req.Host = "edge.example.test"
+	rec := httptest.NewRecorder()
+	service.publicHTTPHandler().ServeHTTP(rec, req)
+	if rec.Result().StatusCode != http.StatusNotFound {
+		t.Fatalf("plain HTTP /pprof status = %d, want %d", rec.Result().StatusCode, http.StatusNotFound)
 	}
 }
 

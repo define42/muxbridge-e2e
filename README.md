@@ -54,6 +54,9 @@ heartbeat_interval: "15s"
 heartbeat_timeout: "45s"
 replace_grace_period: "30s"
 
+# Optional. Expose Go pprof handlers on https://edge_domain/pprof/... only when true.
+debug: false
+
 client_credentials:
   demo-token:
     - demo.example.com
@@ -62,6 +65,32 @@ client_credentials:
 
 A hostname may appear under only one token. A client's registered hostnames must exactly equal the hostnames listed for its token (same set, order-independent).
 When the edge manages its own certificate via CertMagic, `acme_email` becomes the ACME account contact for `edge_domain`.
+
+### Profiling
+
+When `debug: true` is set in the edge config, the standard `net/http/pprof` handlers are exposed on the edge domain under `/pprof/` over HTTPS:
+
+```text
+https://edge.<public-domain>/pprof/          # index of available profiles
+https://edge.<public-domain>/pprof/heap
+https://edge.<public-domain>/pprof/goroutine
+https://edge.<public-domain>/pprof/allocs
+https://edge.<public-domain>/pprof/profile   # 30 s CPU profile by default
+https://edge.<public-domain>/pprof/trace
+https://edge.<public-domain>/pprof/cmdline
+https://edge.<public-domain>/pprof/symbol
+```
+
+Example:
+
+```bash
+go tool pprof https://edge.example.com/pprof/heap
+curl "https://edge.example.com/pprof/goroutine?debug=2"
+```
+
+The endpoints are only mounted when debug mode is enabled and return `404` otherwise. They are never exposed on plain HTTP.
+
+**Security**: pprof exposes heap contents, goroutine stacks, and lets callers trigger long-running CPU profiles or execution traces. The edge domain has no built-in authentication, so leaving `debug: true` on in production makes this data world-readable. Restrict access at the network layer with a firewall, IP allowlist, or reverse proxy with auth before enabling it on a public deployment.
 
 ### Client
 
@@ -234,13 +263,13 @@ For Compose, point the client routes at service names instead of `127.0.0.1`, fo
 
 - Reads TLS records up to 64 KiB to extract SNI and ALPN. Anything else (malformed record, wrong content type, oversize ClientHello) closes the connection and increments `muxbridge_edge_clienthello_parse_errors_total`.
 - Missing SNI closes the connection (`muxbridge_edge_missing_sni_closes_total`).
-- SNI matches `edge_domain` → local TLS termination. If the negotiated ALPN is `muxbridge-control/1`, the connection becomes a client control session; otherwise it's routed to the built-in HTTP mux (status page at `/`, `/healthz`, `/readyz`, `/metrics`).
+- SNI matches `edge_domain` → local TLS termination. If the negotiated ALPN is `muxbridge-control/1`, the connection becomes a client control session; otherwise it's routed to the built-in HTTP mux (`/`, `/healthz`, `/readyz`, `/metrics`, and `/pprof/...` when `debug: true`).
 - SNI matches a registered tunneled hostname → new yamux stream, raw passthrough.
 - Anything else closes the connection (`muxbridge_edge_unknown_host_closes_total`). No HTTP error page is generated.
 
 ### Port 80
 
-- Requests for `edge_domain` serve the same status/health/metrics mux (plain HTTP).
+- Requests for `edge_domain` serve the same status/health/metrics mux (plain HTTP). `/pprof` is never exposed on port 80.
 - Everything else returns a `308 Permanent Redirect` to `https://`. ACME HTTP-01 is intentionally not served for tunneled hostnames — use TLS-ALPN-01 from the `client` side.
 
 ### Session Lifecycle

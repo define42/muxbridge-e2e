@@ -16,6 +16,9 @@ heartbeat_interval: "15s"
 heartbeat_timeout: "45s"
 replace_grace_period: "30s"
 
+# Optional. Expose Go pprof handlers on https://edge_domain/pprof/... only when true.
+debug: false
+
 client_credentials:
   demo-token:
     - demo.example.com

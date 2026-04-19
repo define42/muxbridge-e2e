@@ -97,6 +97,31 @@ client_credentials:
 	if cfg.ReplaceGracePeriod.Duration != defaultReplaceGrace {
 		t.Fatalf("ReplaceGracePeriod = %v, want %v", cfg.ReplaceGracePeriod.Duration, defaultReplaceGrace)
 	}
+	if cfg.Debug {
+		t.Fatal("Debug = true, want false by default")
+	}
+}
+
+func TestLoadEdgeConfigParsesDebug(t *testing.T) {
+	t.Parallel()
+
+	path := writeTempYAML(t, `
+public_domain: example.test
+edge_domain: edge.example.test
+data_dir: /tmp/edge
+debug: true
+client_credentials:
+  demo-token:
+    - demo.example.test
+`)
+
+	cfg, err := LoadEdgeConfig(path)
+	if err != nil {
+		t.Fatalf("LoadEdgeConfig() error = %v", err)
+	}
+	if !cfg.Debug {
+		t.Fatal("Debug = false, want true")
+	}
 }
 
 func TestLoadClientConfigAppliesDefaults(t *testing.T) {
