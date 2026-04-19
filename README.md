@@ -117,6 +117,19 @@ routes:
 
 ### Signing Tool
 
+Generate a fresh hex-encoded Ed25519 private seed with:
+
+```bash
+./bin/gen-ed25519-seed
+```
+
+The tool prints both the private seed and its derived public key:
+
+```text
+private_seed_hex: 4242424242424242424242424242424242424242424242424242424242424242
+public_key_hex: 2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12
+```
+
 Generate a client-ready hostname signature with the built-in helper:
 
 ```bash
@@ -124,11 +137,7 @@ export MUXBRIDGE_ED25519_PRIVATE_SEED_HEX=42424242424242424242424242424242424242
 ./bin/sign-domain -domain demo.example.com
 ```
 
-The tool prints a lowercase hex signature to stdout. The private seed is the raw 32-byte Ed25519 seed in hex. The matching public key for the sample seed above is:
-
-```text
-2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12
-```
+The tool prints a lowercase hex signature to stdout. The private seed is the raw 32-byte Ed25519 seed in hex.
 
 ## Build & Run
 

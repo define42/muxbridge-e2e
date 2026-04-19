@@ -464,7 +464,7 @@ func (s *Service) handleControlConn(ctx context.Context, conn net.Conn) {
 		clientSession.Close()
 	}()
 
-	s.logger.Info("client session active", "session_id", clientSession.id, "auth_key", authKey, "hostname", hostname)
+	s.logger.Info("client session active", "session_id", clientSession.id, "hostname", hostname)
 	s.runControlLoop(clientSession, controlStream)
 }
 
@@ -482,7 +482,7 @@ func (s *Service) runControlLoop(session *clientSession, controlStream net.Conn)
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				s.metrics.HeartbeatsMissed.Inc()
-				s.logger.Warn("closing session after heartbeat timeout", "session_id", session.id, "auth_key", session.authKey)
+				s.logger.Warn("closing session after heartbeat timeout", "session_id", session.id)
 				return
 			}
 			if !errors.Is(err, io.EOF) {
