@@ -16,15 +16,14 @@ message Envelope {
 }
 
 message RegisterRequest {
-  string token = 1;
-  repeated string hostnames = 2;
-  string session_id = 3;
+  string hostname = 1;
+  bytes signature = 2;
 }
 
 message RegisterResponse {
   bool accepted = 1;
   string message = 2;
-  repeated string hostnames = 3;
+  string hostname = 3;
   int64 heartbeat_interval_nanos = 4;
   int64 heartbeat_timeout_nanos = 5;
 }

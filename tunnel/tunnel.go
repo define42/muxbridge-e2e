@@ -9,10 +9,12 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/define42/muxbridge-e2e/internal/auth"
 	"github.com/define42/muxbridge-e2e/internal/client"
 	"github.com/define42/muxbridge-e2e/internal/config"
 )
@@ -22,14 +24,15 @@ type Config struct {
 	// EdgeAddr is the host:port of the edge server (required).
 	EdgeAddr string
 
-	// Token authenticates the client with the edge (required).
-	Token string
+	// SignatureHex authenticates the client hostname claim with the edge
+	// (required).
+	SignatureHex string
 
 	// Handler receives decrypted HTTP requests after TLS termination (required).
 	Handler http.Handler
 
-	// Hostnames to register with the edge. The set must exactly match the
-	// hostnames allowed for the token on the edge side (required).
+	// Hostnames to register with the edge. Exactly one hostname is supported
+	// (required).
 	Hostnames []string
 
 	// DataDir is a writable directory for ACME certificate and account
@@ -83,11 +86,11 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	cc := config.ClientConfig{
-		EdgeAddr:  cfg.EdgeAddr,
-		Token:     cfg.Token,
-		DataDir:   cfg.DataDir,
-		AcmeEmail: cfg.AcmeEmail,
-		Routes:    routes,
+		EdgeAddr:     cfg.EdgeAddr,
+		SignatureHex: cfg.SignatureHex,
+		DataDir:      cfg.DataDir,
+		AcmeEmail:    cfg.AcmeEmail,
+		Routes:       routes,
 	}
 	if cfg.ReconnectMin > 0 {
 		cc.ReconnectMin.Duration = cfg.ReconnectMin
@@ -133,14 +136,20 @@ func validate(cfg Config) error {
 	if cfg.EdgeAddr == "" {
 		return errors.New("tunnel: EdgeAddr is required")
 	}
-	if cfg.Token == "" {
-		return errors.New("tunnel: Token is required")
+	if _, err := auth.ParseSignatureHex(cfg.SignatureHex); err != nil {
+		return fmt.Errorf("tunnel: invalid SignatureHex: %w", err)
 	}
 	if cfg.Handler == nil {
 		return errors.New("tunnel: Handler is required")
 	}
 	if len(cfg.Hostnames) == 0 {
 		return errors.New("tunnel: Hostnames is required")
+	}
+	if len(cfg.Hostnames) != 1 {
+		return errors.New("tunnel: exactly one hostname is required")
+	}
+	if err := auth.ValidateHostname(auth.NormalizeHostname(cfg.Hostnames[0])); err != nil {
+		return fmt.Errorf("tunnel: invalid hostname: %w", err)
 	}
 	if cfg.TLSConfig == nil && cfg.DataDir == "" {
 		return errors.New("tunnel: DataDir is required when TLSConfig is not set")

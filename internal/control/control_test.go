@@ -19,9 +19,8 @@ func TestEnvelopeAndStreamHeaderRoundTrip(t *testing.T) {
 	env := &controlpb.Envelope{
 		Message: &controlpb.Envelope_RegisterRequest{
 			RegisterRequest: &controlpb.RegisterRequest{
-				Token:     "demo-token",
-				Hostnames: []string{"demo.example.test"},
-				SessionId: "session-1",
+				Hostname:  "demo.example.test",
+				Signature: []byte{1, 2, 3},
 			},
 		},
 	}
@@ -42,8 +41,8 @@ func TestEnvelopeAndStreamHeaderRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadEnvelope() error = %v", err)
 	}
-	if gotEnv.GetRegisterRequest().GetToken() != "demo-token" {
-		t.Fatalf("ReadEnvelope() token = %q, want %q", gotEnv.GetRegisterRequest().GetToken(), "demo-token")
+	if gotEnv.GetRegisterRequest().GetHostname() != "demo.example.test" {
+		t.Fatalf("ReadEnvelope() hostname = %q, want %q", gotEnv.GetRegisterRequest().GetHostname(), "demo.example.test")
 	}
 
 	gotHeader, err := ReadStreamHeader(&buf)

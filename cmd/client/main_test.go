@@ -34,7 +34,7 @@ func TestMainStartsAndStops(t *testing.T) {
 
 	configPath := filepath.Join(t.TempDir(), "client.yaml")
 	configBody := fmt.Sprintf(`edge_addr: "127.0.0.1:1"
-token: "demo-token"
+signature_hex: "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
 data_dir: %q
 acme_email: "ops@example.test"
 reconnect_min: "10ms"

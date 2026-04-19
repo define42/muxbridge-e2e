@@ -48,9 +48,7 @@ listen_http: "127.0.0.1:0"
 data_dir: %q
 tls_cert_file: %q
 tls_key_file: %q
-client_credentials:
-  demo-token:
-    - "demo.example.test"
+auth_public_key_hex: "0000000000000000000000000000000000000000000000000000000000000000"
 `, filepath.Join(tempDir, "edge-data"), certPath, keyPath)
 	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)

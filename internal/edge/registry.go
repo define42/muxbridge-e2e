@@ -14,7 +14,7 @@ import (
 
 type clientSession struct {
 	id            string
-	token         string
+	authKey       string
 	hostnames     []string
 	mux           *yamux.Session
 	controlStream ioCloser
@@ -116,7 +116,7 @@ func (s *clientSession) Close() {
 type sessionRegistry struct {
 	mu                    sync.RWMutex
 	byHost                map[string]*clientSession
-	byToken               map[string]*clientSession
+	byAuthKey             map[string]*clientSession
 	metrics               *Metrics
 	maxInflightPerSession int
 	maxTotalInflight      int
@@ -126,7 +126,7 @@ type sessionRegistry struct {
 func newSessionRegistry(metrics *Metrics, maxInflightPerSession, maxTotalInflight int) *sessionRegistry {
 	return &sessionRegistry{
 		byHost:                make(map[string]*clientSession),
-		byToken:               make(map[string]*clientSession),
+		byAuthKey:             make(map[string]*clientSession),
 		metrics:               metrics,
 		maxInflightPerSession: maxInflightPerSession,
 		maxTotalInflight:      maxTotalInflight,
@@ -138,13 +138,13 @@ func (r *sessionRegistry) activate(session *clientSession) (*clientSession, erro
 	defer r.mu.Unlock()
 
 	for _, host := range session.hostnames {
-		if current, ok := r.byHost[host]; ok && current != nil && current != r.byToken[session.token] {
+		if current, ok := r.byHost[host]; ok && current != nil && current != r.byAuthKey[session.authKey] {
 			return nil, errHostnameAlreadyActive(host)
 		}
 	}
 
-	replaced := r.byToken[session.token]
-	r.byToken[session.token] = session
+	replaced := r.byAuthKey[session.authKey]
+	r.byAuthKey[session.authKey] = session
 	for _, host := range session.hostnames {
 		r.byHost[host] = session
 	}
@@ -165,8 +165,8 @@ func (r *sessionRegistry) lookup(host string) *clientSession {
 func (r *sessionRegistry) remove(session *clientSession) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if current := r.byToken[session.token]; current == session {
-		delete(r.byToken, session.token)
+	if current := r.byAuthKey[session.authKey]; current == session {
+		delete(r.byAuthKey, session.authKey)
 	}
 	for _, host := range session.hostnames {
 		if current := r.byHost[host]; current == session {
@@ -178,8 +178,8 @@ func (r *sessionRegistry) remove(session *clientSession) {
 
 func (r *sessionRegistry) shutdown(grace time.Duration) {
 	r.mu.RLock()
-	sessions := make([]*clientSession, 0, len(r.byToken))
-	for _, session := range r.byToken {
+	sessions := make([]*clientSession, 0, len(r.byAuthKey))
+	for _, session := range r.byAuthKey {
 		sessions = append(sessions, session)
 	}
 	r.mu.RUnlock()
@@ -193,7 +193,7 @@ func (r *sessionRegistry) snapshot() registrySnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := registrySnapshot{
-		ActiveSessions: len(r.byToken),
+		ActiveSessions: len(r.byAuthKey),
 		Hostnames:      make([]string, 0, len(r.byHost)),
 	}
 	for host := range r.byHost {
@@ -206,7 +206,7 @@ func (r *sessionRegistry) updateMetricsLocked() {
 	if r.metrics == nil {
 		return
 	}
-	r.metrics.ActiveSessions.Set(float64(len(r.byToken)))
+	r.metrics.ActiveSessions.Set(float64(len(r.byAuthKey)))
 	r.metrics.RegisteredHostnames.Set(float64(len(r.byHost)))
 }
 

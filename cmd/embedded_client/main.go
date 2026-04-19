@@ -42,12 +42,12 @@ func main() {
 	defer stop()
 
 	client, err := tunnel.New(tunnel.Config{
-		EdgeAddr:  "edge.example.com:443",
-		Token:     "demo-token",
-		Hostnames: []string{"demo.example.com"},
-		Handler:   mux,
-		DataDir:   "./certs",
-		AcmeEmail: "ops@example.com",
+		EdgeAddr:     "edge.example.com:443",
+		SignatureHex: "709b40665c0788fbbc5aeb4f8c7b293b7bdcb138c916436999eb81d453881b78bcaa85d4c92d2af0e63b145c78f8e680a784515b15f20f2de2cac13f4b9c0809",
+		Hostnames:    []string{"demo.example.com"},
+		Handler:      mux,
+		DataDir:      "./certs",
+		AcmeEmail:    "ops@example.com",
 	})
 	if err != nil {
 		log.Fatal(err)

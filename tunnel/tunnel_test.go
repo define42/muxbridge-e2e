@@ -1,8 +1,10 @@
 package tunnel_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
@@ -23,6 +25,7 @@ import (
 
 	"github.com/caddyserver/certmagic"
 
+	"github.com/define42/muxbridge-e2e/internal/auth"
 	"github.com/define42/muxbridge-e2e/internal/client"
 	"github.com/define42/muxbridge-e2e/internal/config"
 	"github.com/define42/muxbridge-e2e/internal/edge"
@@ -39,12 +42,13 @@ func TestTunnelNewValidation(t *testing.T) {
 		cfg     tunnel.Config
 		wantErr string
 	}{
-		{"missing EdgeAddr", tunnel.Config{Token: "t", Handler: handler, Hostnames: []string{"h"}, DataDir: "/tmp"}, "EdgeAddr"},
-		{"missing Token", tunnel.Config{EdgeAddr: "a:443", Handler: handler, Hostnames: []string{"h"}, DataDir: "/tmp"}, "Token"},
-		{"missing Handler", tunnel.Config{EdgeAddr: "a:443", Token: "t", Hostnames: []string{"h"}, DataDir: "/tmp"}, "Handler"},
-		{"missing Hostnames", tunnel.Config{EdgeAddr: "a:443", Token: "t", Handler: handler, DataDir: "/tmp"}, "Hostnames"},
-		{"missing DataDir without TLSConfig", tunnel.Config{EdgeAddr: "a:443", Token: "t", Handler: handler, Hostnames: []string{"h"}}, "DataDir"},
-		{"DataDir not required with TLSConfig", tunnel.Config{EdgeAddr: "a:443", Token: "t", Handler: handler, Hostnames: []string{"h"}, TLSConfig: &tls.Config{}}, ""},
+		{"missing EdgeAddr", tunnel.Config{SignatureHex: testTunnelSignatureHex("demo.example.test"), Handler: handler, Hostnames: []string{"demo.example.test"}, DataDir: "/tmp"}, "EdgeAddr"},
+		{"missing SignatureHex", tunnel.Config{EdgeAddr: "a:443", Handler: handler, Hostnames: []string{"demo.example.test"}, DataDir: "/tmp"}, "SignatureHex"},
+		{"missing Handler", tunnel.Config{EdgeAddr: "a:443", SignatureHex: testTunnelSignatureHex("demo.example.test"), Hostnames: []string{"demo.example.test"}, DataDir: "/tmp"}, "Handler"},
+		{"missing Hostnames", tunnel.Config{EdgeAddr: "a:443", SignatureHex: testTunnelSignatureHex("demo.example.test"), Handler: handler, DataDir: "/tmp"}, "Hostnames"},
+		{"multiple Hostnames", tunnel.Config{EdgeAddr: "a:443", SignatureHex: testTunnelSignatureHex("demo.example.test"), Handler: handler, Hostnames: []string{"a.example.test", "b.example.test"}, DataDir: "/tmp"}, "exactly one hostname"},
+		{"missing DataDir without TLSConfig", tunnel.Config{EdgeAddr: "a:443", SignatureHex: testTunnelSignatureHex("demo.example.test"), Handler: handler, Hostnames: []string{"demo.example.test"}}, "DataDir"},
+		{"DataDir not required with TLSConfig", tunnel.Config{EdgeAddr: "a:443", SignatureHex: testTunnelSignatureHex("demo.example.test"), Handler: handler, Hostnames: []string{"demo.example.test"}, TLSConfig: &tls.Config{}}, ""},
 	}
 
 	for _, tt := range tests {
@@ -91,7 +95,7 @@ func TestTunnelHandlerE2E(t *testing.T) {
 		DataDir:            filepath.Join(edgeDir, "data"),
 		TLSCertFile:        edgeCertFile,
 		TLSKeyFile:         edgeKeyFile,
-		ClientCredentials:  map[string][]string{"test-token": {demoDomain}},
+		AuthPublicKeyHex:   testTunnelPublicKeyHex(),
 		HandshakeTimeout:   config.Duration{Duration: 2 * time.Second},
 		HeartbeatInterval:  config.Duration{Duration: 200 * time.Millisecond},
 		HeartbeatTimeout:   config.Duration{Duration: 900 * time.Millisecond},
@@ -120,7 +124,7 @@ func TestTunnelHandlerE2E(t *testing.T) {
 	// the Handler field to prove the Handler wiring works end-to-end.
 	svc, err := client.New(config.ClientConfig{
 		EdgeAddr:     net.JoinHostPort(edgeDomain, port),
-		Token:        "test-token",
+		SignatureHex: testTunnelSignatureHex(demoDomain),
 		DataDir:      filepath.Join(t.TempDir(), "tunnel-client"),
 		AcmeEmail:    "test@tunnel-test.test",
 		Routes:       map[string]string{demoDomain: "http://localhost"},
@@ -173,6 +177,21 @@ func fixedDialer(addr string) func(ctx context.Context, network, _ string) (net.
 	return func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
 	}
+}
+
+func testTunnelPublicKeyHex() string {
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	return auth.SignatureHex(privateKey.Public().(ed25519.PublicKey))
+}
+
+func testTunnelSignatureHex(hostname string) string {
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	signature, err := auth.SignHostname(seed, hostname)
+	if err != nil {
+		panic(err)
+	}
+	return auth.SignatureHex(signature)
 }
 
 func waitFor(t *testing.T, timeout time.Duration, fn func() error) {

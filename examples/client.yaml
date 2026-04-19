@@ -1,5 +1,5 @@
 edge_addr: "edge.example.com:443"
-token: "demo-token"
+signature_hex: "709b40665c0788fbbc5aeb4f8c7b293b7bdcb138c916436999eb81d453881b78bcaa85d4c92d2af0e63b145c78f8e680a784515b15f20f2de2cac13f4b9c0809"
 data_dir: "/var/lib/muxbridge-e2e-client"
 acme_email: "ops@example.com"
 
@@ -8,4 +8,3 @@ reconnect_max: "30s"
 
 routes:
   demo.example.com: "http://127.0.0.1:8080"
-  api.demo.example.com: "http://127.0.0.1:9000"

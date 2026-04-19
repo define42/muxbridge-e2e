@@ -2,9 +2,7 @@ package client
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/tls"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -45,6 +43,7 @@ type Options struct {
 
 type Service struct {
 	cfg                 config.ClientConfig
+	signature           []byte
 	logger              *slog.Logger
 	dialContext         func(ctx context.Context, network, addr string) (net.Conn, error)
 	controlTLSConfig    *tls.Config
@@ -68,6 +67,13 @@ func New(cfg config.ClientConfig, opts Options) (*Service, error) {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	signature, err := cfg.Signature()
+	if err != nil {
+		return nil, err
+	}
+	if len(cfg.Hostnames()) != 1 {
+		return nil, errors.New("client requires exactly one route hostname")
 	}
 	dialContext := opts.DialContext
 	if dialContext == nil {
@@ -100,6 +106,7 @@ func New(cfg config.ClientConfig, opts Options) (*Service, error) {
 
 	return &Service{
 		cfg:                 cfg,
+		signature:           signature,
 		logger:              logger,
 		dialContext:         dialContext,
 		controlTLSConfig:    opts.ControlTLSConfig,
@@ -236,12 +243,15 @@ func (s *Service) connectOnce(ctx context.Context) error {
 	}()
 
 	controlWriter := control.NewLockedWriter(controlStream)
+	signature, err := s.registrationSignature()
+	if err != nil {
+		return err
+	}
 	if err := controlWriter.WriteEnvelope(&controlpb.Envelope{
 		Message: &controlpb.Envelope_RegisterRequest{
 			RegisterRequest: &controlpb.RegisterRequest{
-				Token:     s.cfg.Token,
-				Hostnames: s.cfg.Hostnames(),
-				SessionId: newSessionID(),
+				Hostname:  s.cfg.Hostname(),
+				Signature: signature,
 			},
 		},
 	}); err != nil {
@@ -519,6 +529,17 @@ func (s *Service) trackActiveConn(conn net.Conn) func() {
 	}
 }
 
+func (s *Service) registrationSignature() ([]byte, error) {
+	if len(s.signature) != 0 {
+		return append([]byte(nil), s.signature...), nil
+	}
+	signature, err := s.cfg.Signature()
+	if err != nil {
+		return nil, err
+	}
+	return signature, nil
+}
+
 func (s *Service) closeActiveConns() {
 	s.activeConnsMu.Lock()
 	if len(s.activeConns) == 0 {
@@ -561,12 +582,4 @@ func uniqueStrings(values ...string) []string {
 		out = append(out, value)
 	}
 	return out
-}
-
-func newSessionID() string {
-	var raw [8]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return fmt.Sprintf("client-%d", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(raw[:])
 }

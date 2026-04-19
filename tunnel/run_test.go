@@ -68,10 +68,10 @@ func TestNewWithProvidedTLSConfigAllowsEmptyDataDirAtStart(t *testing.T) {
 	t.Parallel()
 
 	client, err := New(Config{
-		EdgeAddr:  "edge.example.test:443",
-		Token:     "demo-token",
-		Handler:   http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
-		Hostnames: []string{"demo.example.test"},
+		EdgeAddr:     "edge.example.test:443",
+		SignatureHex: "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+		Handler:      http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+		Hostnames:    []string{"demo.example.test"},
 		TLSConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},

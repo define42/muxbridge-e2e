@@ -21,7 +21,7 @@ func TestSessionRegistryActivateLookupRemoveAndSnapshot(t *testing.T) {
 
 	registry := newSessionRegistry(NewMetrics(prometheus.NewRegistry()), 0, 0)
 	first := &clientSession{
-		token:     "demo-token",
+		authKey:   "demo-token",
 		hostnames: []string{"demo.example.test"},
 		registry:  registry,
 		closed:    make(chan struct{}),
@@ -53,7 +53,7 @@ func TestSessionRegistryActivateLookupRemoveAndSnapshot(t *testing.T) {
 	}
 
 	replacement := &clientSession{
-		token:     "demo-token",
+		authKey:   "demo-token",
 		hostnames: []string{"demo.example.test"},
 		registry:  registry,
 		closed:    make(chan struct{}),
@@ -67,7 +67,7 @@ func TestSessionRegistryActivateLookupRemoveAndSnapshot(t *testing.T) {
 	}
 
 	conflict := &clientSession{
-		token:     "other-token",
+		authKey:   "other-token",
 		hostnames: []string{"demo.example.test"},
 		registry:  registry,
 		closed:    make(chan struct{}),
@@ -102,7 +102,7 @@ func TestClientSessionOpenStreamBeginDrainAndFinishStream(t *testing.T) {
 	controlStream := &bufferCloser{}
 	session := &clientSession{
 		id:            "session-1",
-		token:         "demo-token",
+		authKey:       "demo-token",
 		hostnames:     []string{"demo.example.test"},
 		mux:           sessionMux,
 		controlStream: controlStream,
@@ -214,7 +214,7 @@ func TestClientSessionOpenStreamRejectsPerSessionInflightLimit(t *testing.T) {
 	controlStream := &bufferCloser{}
 	session := &clientSession{
 		id:            "session-limit",
-		token:         "demo-token",
+		authKey:       "demo-token",
 		hostnames:     []string{"demo.example.test"},
 		mux:           sessionMux,
 		controlStream: controlStream,
@@ -292,7 +292,7 @@ func TestClientSessionOpenStreamRollsBackReservationsWhenMuxOpenFails(t *testing
 	controlStream := &bufferCloser{}
 	session := &clientSession{
 		id:            "session-rollback",
-		token:         "demo-token",
+		authKey:       "demo-token",
 		hostnames:     []string{"demo.example.test"},
 		mux:           sessionMux,
 		controlStream: controlStream,
@@ -322,7 +322,7 @@ func newDrainableSession(t *testing.T, registry *sessionRegistry, token, hostnam
 	controlStream := &bufferCloser{}
 	return &clientSession{
 		id:            hostname,
-		token:         token,
+		authKey:       token,
 		hostnames:     []string{hostname},
 		mux:           muxSession,
 		controlStream: controlStream,

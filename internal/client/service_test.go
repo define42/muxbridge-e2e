@@ -26,21 +26,24 @@ import (
 	"github.com/caddyserver/certmagic"
 	"github.com/hashicorp/yamux"
 
+	"github.com/define42/muxbridge-e2e/internal/auth"
 	"github.com/define42/muxbridge-e2e/internal/config"
 	"github.com/define42/muxbridge-e2e/internal/control"
 	"github.com/define42/muxbridge-e2e/internal/sni"
 	controlpb "github.com/define42/muxbridge-e2e/proto"
 )
 
+const testSignatureHex = "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+
 func TestNewUsesDefaultsAndHandlerOptions(t *testing.T) {
 	t.Parallel()
 
 	cfg := config.ClientConfig{
-		EdgeAddr:  "edge.example.test:443",
-		Token:     "demo-token",
-		DataDir:   t.TempDir(),
-		AcmeEmail: "ops@example.test",
-		Routes:    map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
+		EdgeAddr:     "edge.example.test:443",
+		SignatureHex: testSignatureHex,
+		DataDir:      t.TempDir(),
+		AcmeEmail:    "ops@example.test",
+		Routes:       map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
 	}
 
 	svc, err := New(cfg, Options{})
@@ -53,11 +56,11 @@ func TestNewUsesDefaultsAndHandlerOptions(t *testing.T) {
 
 	handler := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
 	svc, err = New(config.ClientConfig{
-		EdgeAddr:  "edge.example.test:443",
-		Token:     "demo-token",
-		DataDir:   t.TempDir(),
-		AcmeEmail: "ops@example.test",
-		Routes:    map[string]string{"demo.example.test": "://bad-url"},
+		EdgeAddr:     "edge.example.test:443",
+		SignatureHex: testSignatureHex,
+		DataDir:      t.TempDir(),
+		AcmeEmail:    "ops@example.test",
+		Routes:       map[string]string{"demo.example.test": "://bad-url"},
 	}, Options{Handler: handler})
 	if err != nil {
 		t.Fatalf("New() with custom handler error = %v", err)
@@ -73,11 +76,11 @@ func TestNewUsesDefaultsAndHandlerOptions(t *testing.T) {
 		t.Fatalf("New(valid) error = %v", err)
 	}
 	if _, err := New(config.ClientConfig{
-		EdgeAddr:  "edge.example.test:443",
-		Token:     "demo-token",
-		DataDir:   t.TempDir(),
-		AcmeEmail: "ops@example.test",
-		Routes:    map[string]string{"demo.example.test": "://bad-url"},
+		EdgeAddr:     "edge.example.test:443",
+		SignatureHex: testSignatureHex,
+		DataDir:      t.TempDir(),
+		AcmeEmail:    "ops@example.test",
+		Routes:       map[string]string{"demo.example.test": "://bad-url"},
 	}, Options{}); err == nil || !strings.Contains(err.Error(), "parse upstream") {
 		t.Fatalf("New(invalid route) error = %v, want parse upstream error", err)
 	}
@@ -173,9 +176,6 @@ func TestBuildClientTLSConfigAndHelpers(t *testing.T) {
 	if got := uniqueStrings("h2", "http/1.1", "h2"); len(got) != 2 || got[0] != "h2" || got[1] != "http/1.1" {
 		t.Fatalf("uniqueStrings() = %v, want de-duplicated values", got)
 	}
-	if got := newSessionID(); len(got) == 0 {
-		t.Fatal("newSessionID() returned an empty string")
-	}
 }
 
 func TestNewWithProvidedTLSConfigBypassesCertManager(t *testing.T) {
@@ -186,11 +186,11 @@ func TestNewWithProvidedTLSConfigBypassesCertManager(t *testing.T) {
 		NextProtos: []string{"custom-proto"},
 	}
 	svc, err := New(config.ClientConfig{
-		EdgeAddr:  "edge.example.test:443",
-		Token:     "demo-token",
-		DataDir:   "",
-		AcmeEmail: "",
-		Routes:    map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
+		EdgeAddr:     "edge.example.test:443",
+		SignatureHex: testSignatureHex,
+		DataDir:      "",
+		AcmeEmail:    "",
+		Routes:       map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
 	}, Options{
 		TLSConfig: provided,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -222,7 +222,7 @@ func TestStartWithProvidedTLSConfigDoesNotRequireDataDir(t *testing.T) {
 
 	svc, err := New(config.ClientConfig{
 		EdgeAddr:     "edge.example.test:443",
-		Token:        "demo-token",
+		SignatureHex: testSignatureHex,
 		DataDir:      "",
 		AcmeEmail:    "",
 		Routes:       map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
@@ -261,7 +261,7 @@ func TestStartWaitAndClose(t *testing.T) {
 
 	svc, err := New(config.ClientConfig{
 		EdgeAddr:     "edge.example.test:443",
-		Token:        "demo-token",
+		SignatureHex: testSignatureHex,
 		DataDir:      t.TempDir(),
 		AcmeEmail:    "ops@example.test",
 		Routes:       map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
@@ -422,8 +422,11 @@ func TestConnectOnceRegistrationRejected(t *testing.T) {
 			if req == nil {
 				return fmt.Errorf("register request = nil")
 			}
-			if req.Token != "demo-token" {
-				return fmt.Errorf("token = %q, want %q", req.Token, "demo-token")
+			if req.GetHostname() != "demo.example.test" {
+				return fmt.Errorf("hostname = %q, want %q", req.GetHostname(), "demo.example.test")
+			}
+			if got := auth.SignatureHex(req.GetSignature()); got != testSignatureHex {
+				return fmt.Errorf("signature = %q, want %q", got, testSignatureHex)
 			}
 
 			return control.WriteEnvelope(stream, &controlpb.Envelope{
@@ -439,9 +442,9 @@ func TestConnectOnceRegistrationRejected(t *testing.T) {
 
 	svc := &Service{
 		cfg: config.ClientConfig{
-			EdgeAddr: "edge.example.test:443",
-			Token:    "demo-token",
-			Routes:   map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
+			EdgeAddr:     "edge.example.test:443",
+			SignatureHex: testSignatureHex,
+			Routes:       map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
 		},
 		logger:           slogDiscard(),
 		dialContext:      singleUseDialer(t, clientConn),
@@ -487,8 +490,11 @@ func TestConnectOnceReturnsOnContextCancellationAfterRegistration(t *testing.T) 
 			if req == nil {
 				return fmt.Errorf("register request = nil")
 			}
-			if req.Token != "demo-token" {
-				return fmt.Errorf("token = %q, want %q", req.Token, "demo-token")
+			if req.GetHostname() != "demo.example.test" {
+				return fmt.Errorf("hostname = %q, want %q", req.GetHostname(), "demo.example.test")
+			}
+			if got := auth.SignatureHex(req.GetSignature()); got != testSignatureHex {
+				return fmt.Errorf("signature = %q, want %q", got, testSignatureHex)
 			}
 			if err := control.WriteEnvelope(stream, &controlpb.Envelope{
 				Message: &controlpb.Envelope_RegisterResponse{
@@ -513,9 +519,9 @@ func TestConnectOnceReturnsOnContextCancellationAfterRegistration(t *testing.T) 
 
 	svc := &Service{
 		cfg: config.ClientConfig{
-			EdgeAddr: "edge.example.test:443",
-			Token:    "demo-token",
-			Routes:   map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
+			EdgeAddr:     "edge.example.test:443",
+			SignatureHex: testSignatureHex,
+			Routes:       map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
 		},
 		logger:           slogDiscard(),
 		dialContext:      singleUseDialer(t, clientConn),

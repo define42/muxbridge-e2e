@@ -1,12 +1,14 @@
 package config
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"time"
 
+	"github.com/define42/muxbridge-e2e/internal/auth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -42,46 +44,46 @@ func (d Duration) MarshalYAML() (any, error) {
 }
 
 type EdgeConfig struct {
-	PublicDomain          string              `yaml:"public_domain"`
-	EdgeDomain            string              `yaml:"edge_domain"`
-	ListenHTTPS           string              `yaml:"listen_https"`
-	ListenHTTP            string              `yaml:"listen_http"`
-	DataDir               string              `yaml:"data_dir"`
-	AcmeEmail             string              `yaml:"acme_email"`
-	TLSCertFile           string              `yaml:"tls_cert_file"`
-	TLSKeyFile            string              `yaml:"tls_key_file"`
-	Debug                 bool                `yaml:"debug"`
-	MaxInflightPerSession int                 `yaml:"max_inflight_per_session"`
-	MaxTotalInflight      int                 `yaml:"max_total_inflight"`
-	ClientCredentials     map[string][]string `yaml:"client_credentials"`
-	HandshakeTimeout      Duration            `yaml:"handshake_timeout"`
-	HeartbeatInterval     Duration            `yaml:"heartbeat_interval"`
-	HeartbeatTimeout      Duration            `yaml:"heartbeat_timeout"`
-	ReplaceGracePeriod    Duration            `yaml:"replace_grace_period"`
+	PublicDomain          string   `yaml:"public_domain"`
+	EdgeDomain            string   `yaml:"edge_domain"`
+	ListenHTTPS           string   `yaml:"listen_https"`
+	ListenHTTP            string   `yaml:"listen_http"`
+	DataDir               string   `yaml:"data_dir"`
+	AcmeEmail             string   `yaml:"acme_email"`
+	TLSCertFile           string   `yaml:"tls_cert_file"`
+	TLSKeyFile            string   `yaml:"tls_key_file"`
+	Debug                 bool     `yaml:"debug"`
+	MaxInflightPerSession int      `yaml:"max_inflight_per_session"`
+	MaxTotalInflight      int      `yaml:"max_total_inflight"`
+	AuthPublicKeyHex      string   `yaml:"auth_public_key_hex"`
+	HandshakeTimeout      Duration `yaml:"handshake_timeout"`
+	HeartbeatInterval     Duration `yaml:"heartbeat_interval"`
+	HeartbeatTimeout      Duration `yaml:"heartbeat_timeout"`
+	ReplaceGracePeriod    Duration `yaml:"replace_grace_period"`
 }
 
 type edgeConfigYAML struct {
-	PublicDomain          string              `yaml:"public_domain"`
-	EdgeDomain            string              `yaml:"edge_domain"`
-	ListenHTTPS           string              `yaml:"listen_https"`
-	ListenHTTP            string              `yaml:"listen_http"`
-	DataDir               string              `yaml:"data_dir"`
-	AcmeEmail             string              `yaml:"acme_email"`
-	TLSCertFile           string              `yaml:"tls_cert_file"`
-	TLSKeyFile            string              `yaml:"tls_key_file"`
-	Debug                 bool                `yaml:"debug"`
-	MaxInflightPerSession *int                `yaml:"max_inflight_per_session"`
-	MaxTotalInflight      *int                `yaml:"max_total_inflight"`
-	ClientCredentials     map[string][]string `yaml:"client_credentials"`
-	HandshakeTimeout      Duration            `yaml:"handshake_timeout"`
-	HeartbeatInterval     Duration            `yaml:"heartbeat_interval"`
-	HeartbeatTimeout      Duration            `yaml:"heartbeat_timeout"`
-	ReplaceGracePeriod    Duration            `yaml:"replace_grace_period"`
+	PublicDomain          string   `yaml:"public_domain"`
+	EdgeDomain            string   `yaml:"edge_domain"`
+	ListenHTTPS           string   `yaml:"listen_https"`
+	ListenHTTP            string   `yaml:"listen_http"`
+	DataDir               string   `yaml:"data_dir"`
+	AcmeEmail             string   `yaml:"acme_email"`
+	TLSCertFile           string   `yaml:"tls_cert_file"`
+	TLSKeyFile            string   `yaml:"tls_key_file"`
+	Debug                 bool     `yaml:"debug"`
+	MaxInflightPerSession *int     `yaml:"max_inflight_per_session"`
+	MaxTotalInflight      *int     `yaml:"max_total_inflight"`
+	AuthPublicKeyHex      string   `yaml:"auth_public_key_hex"`
+	HandshakeTimeout      Duration `yaml:"handshake_timeout"`
+	HeartbeatInterval     Duration `yaml:"heartbeat_interval"`
+	HeartbeatTimeout      Duration `yaml:"heartbeat_timeout"`
+	ReplaceGracePeriod    Duration `yaml:"replace_grace_period"`
 }
 
 type ClientConfig struct {
 	EdgeAddr     string            `yaml:"edge_addr"`
-	Token        string            `yaml:"token"`
+	SignatureHex string            `yaml:"signature_hex"`
 	DataDir      string            `yaml:"data_dir"`
 	AcmeEmail    string            `yaml:"acme_email"`
 	Routes       map[string]string `yaml:"routes"`
@@ -140,7 +142,7 @@ func (c *EdgeConfig) UnmarshalYAML(value *yaml.Node) error {
 		Debug:                 raw.Debug,
 		MaxInflightPerSession: maxInflightPerSession,
 		MaxTotalInflight:      maxTotalInflight,
-		ClientCredentials:     raw.ClientCredentials,
+		AuthPublicKeyHex:      raw.AuthPublicKeyHex,
 		HandshakeTimeout:      raw.HandshakeTimeout,
 		HeartbeatInterval:     raw.HeartbeatInterval,
 		HeartbeatTimeout:      raw.HeartbeatTimeout,
@@ -205,8 +207,8 @@ func (c EdgeConfig) Validate() error {
 	if c.DataDir == "" {
 		return errors.New("data_dir is required")
 	}
-	if len(c.ClientCredentials) == 0 {
-		return errors.New("client_credentials must not be empty")
+	if _, err := c.AuthPublicKey(); err != nil {
+		return err
 	}
 	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
 		return errors.New("tls_cert_file and tls_key_file must be provided together")
@@ -217,29 +219,6 @@ func (c EdgeConfig) Validate() error {
 	if c.MaxTotalInflight < 0 {
 		return errors.New("max_total_inflight must be greater than or equal to zero")
 	}
-	seenHosts := make(map[string]string)
-	for token, hosts := range c.ClientCredentials {
-		if token == "" {
-			return errors.New("client_credentials contains an empty token")
-		}
-		if len(hosts) == 0 {
-			return fmt.Errorf("token %q must allow at least one hostname", token)
-		}
-		ordered := append([]string(nil), hosts...)
-		sort.Strings(ordered)
-		for i, host := range ordered {
-			if host == "" {
-				return fmt.Errorf("token %q contains an empty hostname", token)
-			}
-			if i > 0 && ordered[i-1] == host {
-				return fmt.Errorf("token %q contains duplicate hostname %q", token, host)
-			}
-			if other, ok := seenHosts[host]; ok {
-				return fmt.Errorf("hostname %q assigned to both token %q and token %q", host, other, token)
-			}
-			seenHosts[host] = token
-		}
-	}
 	return nil
 }
 
@@ -247,8 +226,8 @@ func (c ClientConfig) Validate() error {
 	if c.EdgeAddr == "" {
 		return errors.New("edge_addr is required")
 	}
-	if c.Token == "" {
-		return errors.New("token is required")
+	if _, err := c.Signature(); err != nil {
+		return err
 	}
 	if c.DataDir == "" {
 		return errors.New("data_dir is required")
@@ -259,9 +238,14 @@ func (c ClientConfig) Validate() error {
 	if len(c.Routes) == 0 {
 		return errors.New("routes must not be empty")
 	}
+	if len(c.Routes) != 1 {
+		return errors.New("routes must contain exactly one hostname")
+	}
 	for host, upstream := range c.Routes {
-		if host == "" {
+		if normalized := auth.NormalizeHostname(host); normalized == "" {
 			return errors.New("routes contains an empty hostname")
+		} else if err := auth.ValidateHostname(normalized); err != nil {
+			return fmt.Errorf("invalid route hostname %q: %w", host, err)
 		}
 		if upstream == "" {
 			return fmt.Errorf("route %q has an empty upstream URL", host)
@@ -273,10 +257,34 @@ func (c ClientConfig) Validate() error {
 func (c ClientConfig) Hostnames() []string {
 	hosts := make([]string, 0, len(c.Routes))
 	for host := range c.Routes {
-		hosts = append(hosts, host)
+		hosts = append(hosts, auth.NormalizeHostname(host))
 	}
 	sort.Strings(hosts)
 	return hosts
+}
+
+func (c ClientConfig) Hostname() string {
+	hostnames := c.Hostnames()
+	if len(hostnames) == 0 {
+		return ""
+	}
+	return hostnames[0]
+}
+
+func (c EdgeConfig) AuthPublicKey() (ed25519.PublicKey, error) {
+	publicKey, err := auth.ParsePublicKeyHex(c.AuthPublicKeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("invalid auth_public_key_hex: %w", err)
+	}
+	return publicKey, nil
+}
+
+func (c ClientConfig) Signature() ([]byte, error) {
+	signature, err := auth.ParseSignatureHex(c.SignatureHex)
+	if err != nil {
+		return nil, fmt.Errorf("invalid signature_hex: %w", err)
+	}
+	return signature, nil
 }
 
 func load(path string, target any) error {

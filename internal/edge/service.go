@@ -2,6 +2,7 @@ package edge
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
@@ -13,7 +14,6 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
+	"github.com/define42/muxbridge-e2e/internal/auth"
 	"github.com/define42/muxbridge-e2e/internal/config"
 	"github.com/define42/muxbridge-e2e/internal/control"
 	listenerpkg "github.com/define42/muxbridge-e2e/internal/listener"
@@ -57,6 +58,9 @@ type Service struct {
 	certManager       *certmagic.Config
 	certIssuerFactory func(*certmagic.Config) certmagic.Issuer
 	manageSync        bool
+	authKeyOnce       sync.Once
+	authKeyErr        error
+	authPublicKey     []byte
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -93,6 +97,9 @@ func New(cfg config.EdgeConfig, opts Options) *Service {
 }
 
 func (s *Service) Start(ctx context.Context) error {
+	if _, err := s.registrationPublicKey(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(s.cfg.DataDir, 0o755); err != nil {
 		return fmt.Errorf("create edge data dir: %w", err)
 	}
@@ -392,7 +399,7 @@ func (s *Service) handleControlConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	hostnames, err := s.authorizeRegistration(register)
+	hostname, authKey, err := s.authorizeRegistration(register)
 	if err != nil {
 		_ = control.WriteEnvelope(controlStream, &controlpb.Envelope{
 			Message: &controlpb.Envelope_RegisterResponse{
@@ -408,8 +415,8 @@ func (s *Service) handleControlConn(ctx context.Context, conn net.Conn) {
 
 	clientSession := &clientSession{
 		id:            newSessionID(),
-		token:         register.Token,
-		hostnames:     hostnames,
+		authKey:       authKey,
+		hostnames:     []string{hostname},
 		mux:           session,
 		controlStream: controlStream,
 		controlWriter: control.NewLockedWriter(controlStream),
@@ -437,7 +444,7 @@ func (s *Service) handleControlConn(ctx context.Context, conn net.Conn) {
 			RegisterResponse: &controlpb.RegisterResponse{
 				Accepted:               true,
 				Message:                "registered",
-				Hostnames:              hostnames,
+				Hostname:               hostname,
 				HeartbeatIntervalNanos: s.cfg.HeartbeatInterval.Nanoseconds(),
 				HeartbeatTimeoutNanos:  s.cfg.HeartbeatTimeout.Nanoseconds(),
 			},
@@ -457,7 +464,7 @@ func (s *Service) handleControlConn(ctx context.Context, conn net.Conn) {
 		clientSession.Close()
 	}()
 
-	s.logger.Info("client session active", "session_id", clientSession.id, "token", register.Token, "hostnames", hostnames)
+	s.logger.Info("client session active", "session_id", clientSession.id, "auth_key", authKey, "hostname", hostname)
 	s.runControlLoop(clientSession, controlStream)
 }
 
@@ -475,7 +482,7 @@ func (s *Service) runControlLoop(session *clientSession, controlStream net.Conn)
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				s.metrics.HeartbeatsMissed.Inc()
-				s.logger.Warn("closing session after heartbeat timeout", "session_id", session.id, "token", session.token)
+				s.logger.Warn("closing session after heartbeat timeout", "session_id", session.id, "auth_key", session.authKey)
 				return
 			}
 			if !errors.Is(err, io.EOF) {
@@ -501,25 +508,33 @@ func (s *Service) runControlLoop(session *clientSession, controlStream net.Conn)
 	}
 }
 
-func (s *Service) authorizeRegistration(req *controlpb.RegisterRequest) ([]string, error) {
-	allowed, ok := s.cfg.ClientCredentials[req.Token]
-	if !ok {
-		return nil, fmt.Errorf("unknown client token")
+func (s *Service) authorizeRegistration(req *controlpb.RegisterRequest) (string, string, error) {
+	hostname := auth.NormalizeHostname(req.GetHostname())
+	if err := auth.ValidateHostname(hostname); err != nil {
+		return "", "", fmt.Errorf("invalid hostname: %w", err)
 	}
-	requested := append([]string(nil), req.Hostnames...)
-	for i := range requested {
-		requested[i] = strings.ToLower(requested[i])
+	if strings.EqualFold(hostname, s.cfg.EdgeDomain) {
+		return "", "", fmt.Errorf("registration hostname must not equal edge_domain")
 	}
-	allowed = append([]string(nil), allowed...)
-	for i := range allowed {
-		allowed[i] = strings.ToLower(allowed[i])
+
+	publicKey, err := s.registrationPublicKey()
+	if err != nil {
+		return "", "", err
 	}
-	slices.Sort(requested)
-	slices.Sort(allowed)
-	if !slices.Equal(requested, allowed) {
-		return nil, fmt.Errorf("registration hostnames must exactly match configured hostnames")
+	if err := auth.VerifyHostname(publicKey, hostname, req.GetSignature()); err != nil {
+		return "", "", err
 	}
-	return requested, nil
+	return hostname, auth.SignatureHex(req.GetSignature()), nil
+}
+
+func (s *Service) registrationPublicKey() (ed25519.PublicKey, error) {
+	s.authKeyOnce.Do(func() {
+		s.authPublicKey, s.authKeyErr = s.cfg.AuthPublicKey()
+	})
+	if s.authKeyErr != nil {
+		return nil, s.authKeyErr
+	}
+	return append(ed25519.PublicKey(nil), s.authPublicKey...), nil
 }
 
 func (s *Service) edgeHTTPHandler() http.Handler {

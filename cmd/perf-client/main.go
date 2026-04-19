@@ -29,11 +29,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/define42/muxbridge-e2e/internal/auth"
 	"github.com/define42/muxbridge-e2e/tunnel"
 )
 
 const (
-	defaultPerfToken       = "perf-token"
 	defaultConnections     = 1000
 	defaultDuration        = 30 * time.Second
 	defaultRequestTimeout  = 10 * time.Second
@@ -57,7 +57,7 @@ type perfConfig struct {
 	PublicHost     string
 	PublicDomain   string
 	EdgeAddr       string
-	Token          string
+	SignatureHex   string
 	Scenario       string
 	Connections    int
 	Duration       time.Duration
@@ -168,12 +168,12 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	}
 
 	cli, err := newPerfTunnelClient(tunnel.Config{
-		EdgeAddr:  cfg.EdgeAddr,
-		Token:     cfg.Token,
-		Handler:   newPerfMux(),
-		Hostnames: []string{cfg.PublicHost},
-		TLSConfig: tlsConfig,
-		Logger:    logger,
+		EdgeAddr:     cfg.EdgeAddr,
+		SignatureHex: cfg.SignatureHex,
+		Handler:      newPerfMux(),
+		Hostnames:    []string{cfg.PublicHost},
+		TLSConfig:    tlsConfig,
+		Logger:       logger,
 	})
 	if err != nil {
 		return err
@@ -259,7 +259,7 @@ func loadConfig(args []string, getenv func(string) string) (perfConfig, error) {
 		PublicHost:     getenv("MUXBRIDGE_PUBLIC_HOST"),
 		PublicDomain:   getenv("MUXBRIDGE_PUBLIC_DOMAIN"),
 		EdgeAddr:       getenv("MUXBRIDGE_EDGE_ADDR"),
-		Token:          defaultString(getenv("MUXBRIDGE_CLIENT_TOKEN"), defaultPerfToken),
+		SignatureHex:   getenv("MUXBRIDGE_CLIENT_SIGNATURE_HEX"),
 		Scenario:       defaultScenario,
 		Connections:    defaultConnections,
 		Duration:       defaultDuration,
@@ -271,7 +271,7 @@ func loadConfig(args []string, getenv func(string) string) (perfConfig, error) {
 	fs.StringVar(&cfg.PublicHost, "public-host", cfg.PublicHost, "Public hostname to probe and load-test")
 	fs.StringVar(&cfg.PublicDomain, "public-domain", cfg.PublicDomain, "Public base domain for the edge")
 	fs.StringVar(&cfg.EdgeAddr, "edge-addr", cfg.EdgeAddr, "Edge control address")
-	fs.StringVar(&cfg.Token, "token", cfg.Token, "Client authentication token")
+	fs.StringVar(&cfg.SignatureHex, "signature-hex", cfg.SignatureHex, "Hex-encoded hostname signature for edge registration")
 	fs.IntVar(&cfg.Connections, "connections", cfg.Connections, "Concurrent public connections to keep active")
 	fs.DurationVar(&cfg.Duration, "duration", cfg.Duration, "How long to sustain the load test")
 	fs.StringVar(&cfg.Scenario, "scenario", cfg.Scenario, "Load scenario: fast, stream, mixed")
@@ -285,7 +285,7 @@ func loadConfig(args []string, getenv func(string) string) (perfConfig, error) {
 	cfg.PublicHost = normalizeHostname(cfg.PublicHost)
 	cfg.PublicDomain = normalizeHostname(cfg.PublicDomain)
 	cfg.EdgeAddr = strings.TrimSpace(cfg.EdgeAddr)
-	cfg.Token = strings.TrimSpace(cfg.Token)
+	cfg.SignatureHex = strings.TrimSpace(cfg.SignatureHex)
 	cfg.Scenario = strings.ToLower(strings.TrimSpace(cfg.Scenario))
 
 	if err := validateHostname(cfg.PublicHost); err != nil {
@@ -300,8 +300,8 @@ func loadConfig(args []string, getenv func(string) string) (perfConfig, error) {
 		}
 		cfg.EdgeAddr = "edge." + cfg.PublicDomain + ":443"
 	}
-	if cfg.Token == "" {
-		return perfConfig{}, fmt.Errorf("token is required")
+	if _, err := auth.ParseSignatureHex(cfg.SignatureHex); err != nil {
+		return perfConfig{}, fmt.Errorf("invalid signature hex: %w", err)
 	}
 	if cfg.Connections <= 0 {
 		return perfConfig{}, fmt.Errorf("connections must be greater than zero")
@@ -949,13 +949,6 @@ func waitForClientExit(errCh <-chan error, timeout time.Duration) error {
 	case <-time.After(timeout):
 		return nil
 	}
-}
-
-func defaultString(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
 }
 
 func parseBoolString(value string) bool {

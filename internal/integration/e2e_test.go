@@ -2,8 +2,10 @@ package integration_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
@@ -28,6 +30,7 @@ import (
 	"github.com/caddyserver/certmagic"
 	"github.com/gorilla/websocket"
 
+	"github.com/define42/muxbridge-e2e/internal/auth"
 	"github.com/define42/muxbridge-e2e/internal/client"
 	"github.com/define42/muxbridge-e2e/internal/config"
 	"github.com/define42/muxbridge-e2e/internal/edge"
@@ -61,7 +64,7 @@ func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {
 		DataDir:            filepath.Join(edgeDir, "data"),
 		TLSCertFile:        edgeCertFile,
 		TLSKeyFile:         edgeKeyFile,
-		ClientCredentials:  map[string][]string{"demo-token": {demoDomain}},
+		AuthPublicKeyHex:   integrationPublicKeyHex(),
 		HandshakeTimeout:   config.Duration{Duration: 2 * time.Second},
 		HeartbeatInterval:  config.Duration{Duration: 200 * time.Millisecond},
 		HeartbeatTimeout:   config.Duration{Duration: 900 * time.Millisecond},
@@ -86,7 +89,7 @@ func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {
 
 	clientOne, err := client.New(config.ClientConfig{
 		EdgeAddr:     edgeAddr,
-		Token:        "demo-token",
+		SignatureHex: integrationSignatureHex(demoDomain),
 		DataDir:      filepath.Join(t.TempDir(), "client-one"),
 		AcmeEmail:    "ops@example.test",
 		Routes:       map[string]string{demoDomain: upstreamOne.URL},
@@ -314,7 +317,7 @@ func TestMuxbridgeE2EStaticEdgeCert(t *testing.T) {
 
 		clientTwo, err := client.New(config.ClientConfig{
 			EdgeAddr:     edgeAddr,
-			Token:        "demo-token",
+			SignatureHex: integrationSignatureHex(demoDomain),
 			DataDir:      filepath.Join(t.TempDir(), "client-two"),
 			AcmeEmail:    "ops@example.test",
 			Routes:       map[string]string{demoDomain: upstreamTwo.URL},
@@ -383,7 +386,7 @@ func TestEdgeCertMagicMode(t *testing.T) {
 		ListenHTTPS:        "127.0.0.1:0",
 		ListenHTTP:         "127.0.0.1:0",
 		DataDir:            t.TempDir(),
-		ClientCredentials:  map[string][]string{"demo-token": {"demo.certmagic.test"}},
+		AuthPublicKeyHex:   integrationPublicKeyHex(),
 		HandshakeTimeout:   config.Duration{Duration: 2 * time.Second},
 		HeartbeatInterval:  config.Duration{Duration: 200 * time.Millisecond},
 		HeartbeatTimeout:   config.Duration{Duration: 900 * time.Millisecond},
@@ -440,7 +443,7 @@ func TestACMETLSALPNPassthrough(t *testing.T) {
 		DataDir:            filepath.Join(edgeDir, "data"),
 		TLSCertFile:        edgeCertFile,
 		TLSKeyFile:         edgeKeyFile,
-		ClientCredentials:  map[string][]string{"demo-token": {demoDomain}},
+		AuthPublicKeyHex:   integrationPublicKeyHex(),
 		HandshakeTimeout:   config.Duration{Duration: 2 * time.Second},
 		HeartbeatInterval:  config.Duration{Duration: 200 * time.Millisecond},
 		HeartbeatTimeout:   config.Duration{Duration: 900 * time.Millisecond},
@@ -473,7 +476,7 @@ func TestACMETLSALPNPassthrough(t *testing.T) {
 
 	clientSvc, err := client.New(config.ClientConfig{
 		EdgeAddr:     edgeAddr,
-		Token:        "demo-token",
+		SignatureHex: integrationSignatureHex(demoDomain),
 		DataDir:      filepath.Join(t.TempDir(), "client"),
 		AcmeEmail:    "ops@example.test",
 		Routes:       map[string]string{demoDomain: "http://127.0.0.1:65534"},
@@ -804,6 +807,21 @@ func (i *testIssuer) Issue(_ context.Context, csr *x509.CertificateRequest) (*ce
 		Certificate: append(leafPEM, i.ca.certPEM...),
 		Metadata:    map[string]string{"issuer": i.IssuerKey()},
 	}, nil
+}
+
+func integrationPublicKeyHex() string {
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	return auth.SignatureHex(privateKey.Public().(ed25519.PublicKey))
+}
+
+func integrationSignatureHex(hostname string) string {
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	signature, err := auth.SignHostname(seed, hostname)
+	if err != nil {
+		panic(err)
+	}
+	return auth.SignatureHex(signature)
 }
 
 func discardLogger() *slog.Logger {

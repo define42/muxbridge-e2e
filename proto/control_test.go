@@ -50,14 +50,13 @@ func TestEnvelopeAndMessages(t *testing.T) {
 	}
 
 	registerRequest := &RegisterRequest{
-		Token:     "demo-token",
-		Hostnames: []string{"demo.example.test"},
-		SessionId: "session-1",
+		Hostname:  "demo.example.test",
+		Signature: []byte{1, 2, 3},
 	}
 	registerResponse := &RegisterResponse{
 		Accepted:               true,
 		Message:                "ok",
-		Hostnames:              []string{"demo.example.test"},
+		Hostname:               "demo.example.test",
 		HeartbeatIntervalNanos: 10,
 		HeartbeatTimeoutNanos:  20,
 	}
@@ -71,10 +70,10 @@ func TestEnvelopeAndMessages(t *testing.T) {
 		AcceptedAtUnixNano: 13,
 	}
 
-	if registerRequest.GetToken() != "demo-token" || registerRequest.GetSessionId() != "session-1" || len(registerRequest.GetHostnames()) != 1 {
+	if registerRequest.GetHostname() != "demo.example.test" || len(registerRequest.GetSignature()) != 3 {
 		t.Fatalf("RegisterRequest getters returned unexpected values: %#v", registerRequest)
 	}
-	if !registerResponse.GetAccepted() || registerResponse.GetMessage() != "ok" || registerResponse.GetHeartbeatIntervalNanos() != 10 || registerResponse.GetHeartbeatTimeoutNanos() != 20 {
+	if !registerResponse.GetAccepted() || registerResponse.GetMessage() != "ok" || registerResponse.GetHostname() != "demo.example.test" || registerResponse.GetHeartbeatIntervalNanos() != 10 || registerResponse.GetHeartbeatTimeoutNanos() != 20 {
 		t.Fatalf("RegisterResponse getters returned unexpected values: %#v", registerResponse)
 	}
 	if heartbeat.GetUnixNano() != 11 || heartbeatAck.GetUnixNano() != 12 {
@@ -144,8 +143,8 @@ func TestEnvelopeAndMessages(t *testing.T) {
 	if err := proto.Unmarshal(wire, &roundTrip); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
-	if got := roundTrip.GetRegisterRequest().GetToken(); got != "demo-token" {
-		t.Fatalf("roundTrip token = %q, want %q", got, "demo-token")
+	if got := roundTrip.GetRegisterRequest().GetHostname(); got != "demo.example.test" {
+		t.Fatalf("roundTrip hostname = %q, want %q", got, "demo.example.test")
 	}
 	if roundTrip.GetMessage() == nil {
 		t.Fatal("roundTrip GetMessage() returned nil")
@@ -167,8 +166,8 @@ func TestEnvelopeAndMessages(t *testing.T) {
 			if env.GetRegisterResponse() == nil {
 				t.Fatal("GetRegisterResponse() returned nil")
 			}
-			if len(env.GetRegisterResponse().GetHostnames()) != 1 {
-				t.Fatal("GetHostnames() returned unexpected value")
+			if env.GetRegisterResponse().GetHostname() == "" {
+				t.Fatal("GetHostname() returned unexpected value")
 			}
 			env.Message.(*Envelope_RegisterResponse).isEnvelope_Message()
 		case *Envelope_Heartbeat:

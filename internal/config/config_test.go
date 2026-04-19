@@ -1,12 +1,15 @@
 package config
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/define42/muxbridge-e2e/internal/auth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -38,16 +41,8 @@ func TestDurationUnmarshalYAMLErrors(t *testing.T) {
 		node    *yaml.Node
 		wantErr string
 	}{
-		{
-			name:    "non scalar",
-			node:    &yaml.Node{Kind: yaml.SequenceNode},
-			wantErr: "duration must be a scalar",
-		},
-		{
-			name:    "invalid duration",
-			node:    &yaml.Node{Kind: yaml.ScalarNode, Value: "later"},
-			wantErr: "parse duration",
-		},
+		{name: "non scalar", node: &yaml.Node{Kind: yaml.SequenceNode}, wantErr: "duration must be a scalar"},
+		{name: "invalid duration", node: &yaml.Node{Kind: yaml.ScalarNode, Value: "later"}, wantErr: "parse duration"},
 	}
 
 	for _, tt := range tests {
@@ -70,9 +65,7 @@ func TestLoadEdgeConfigAppliesDefaults(t *testing.T) {
 public_domain: example.test
 edge_domain: edge.example.test
 data_dir: /tmp/edge
-client_credentials:
-  demo-token:
-    - demo.example.test
+auth_public_key_hex: `+testPublicKeyHex()+`
 `)
 
 	cfg, err := LoadEdgeConfig(path)
@@ -108,17 +101,17 @@ client_credentials:
 	}
 }
 
-func TestLoadEdgeConfigParsesDebug(t *testing.T) {
+func TestLoadEdgeConfigParsesDebugAndInflightLimits(t *testing.T) {
 	t.Parallel()
 
 	path := writeTempYAML(t, `
 public_domain: example.test
 edge_domain: edge.example.test
 data_dir: /tmp/edge
+auth_public_key_hex: `+testPublicKeyHex()+`
 debug: true
-client_credentials:
-  demo-token:
-    - demo.example.test
+max_inflight_per_session: 64
+max_total_inflight: 256
 `)
 
 	cfg, err := LoadEdgeConfig(path)
@@ -128,56 +121,11 @@ client_credentials:
 	if !cfg.Debug {
 		t.Fatal("Debug = false, want true")
 	}
-}
-
-func TestLoadEdgeConfigParsesInflightLimits(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name                   string
-		extra                  string
-		wantPerSessionInflight int
-		wantTotalInflight      int
-	}{
-		{
-			name:                   "explicit zero disables both",
-			extra:                  "max_inflight_per_session: 0\nmax_total_inflight: 0\n",
-			wantPerSessionInflight: 0,
-			wantTotalInflight:      0,
-		},
-		{
-			name:                   "explicit values",
-			extra:                  "max_inflight_per_session: 64\nmax_total_inflight: 256\n",
-			wantPerSessionInflight: 64,
-			wantTotalInflight:      256,
-		},
+	if cfg.MaxInflightPerSession != 64 {
+		t.Fatalf("MaxInflightPerSession = %d, want %d", cfg.MaxInflightPerSession, 64)
 	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			path := writeTempYAML(t, `
-public_domain: example.test
-edge_domain: edge.example.test
-data_dir: /tmp/edge
-`+tt.extra+`client_credentials:
-  demo-token:
-    - demo.example.test
-`)
-
-			cfg, err := LoadEdgeConfig(path)
-			if err != nil {
-				t.Fatalf("LoadEdgeConfig() error = %v", err)
-			}
-			if cfg.MaxInflightPerSession != tt.wantPerSessionInflight {
-				t.Fatalf("MaxInflightPerSession = %d, want %d", cfg.MaxInflightPerSession, tt.wantPerSessionInflight)
-			}
-			if cfg.MaxTotalInflight != tt.wantTotalInflight {
-				t.Fatalf("MaxTotalInflight = %d, want %d", cfg.MaxTotalInflight, tt.wantTotalInflight)
-			}
-		})
+	if cfg.MaxTotalInflight != 256 {
+		t.Fatalf("MaxTotalInflight = %d, want %d", cfg.MaxTotalInflight, 256)
 	}
 }
 
@@ -186,11 +134,11 @@ func TestLoadClientConfigAppliesDefaults(t *testing.T) {
 
 	path := writeTempYAML(t, `
 edge_addr: edge.example.test:443
-token: demo-token
+signature_hex: `+testSignatureHex()+`
 data_dir: /tmp/client
 acme_email: ops@example.test
 routes:
-  demo.example.test: http://127.0.0.1:8080
+  Demo.Example.Test.: http://127.0.0.1:8080
 `)
 
 	cfg, err := LoadClientConfig(path)
@@ -202,6 +150,9 @@ routes:
 	}
 	if cfg.ReconnectMax.Duration != defaultReconnectMax {
 		t.Fatalf("ReconnectMax = %v, want %v", cfg.ReconnectMax.Duration, defaultReconnectMax)
+	}
+	if got := cfg.Hostname(); got != "demo.example.test" {
+		t.Fatalf("Hostname() = %q, want %q", got, "demo.example.test")
 	}
 }
 
@@ -229,170 +180,98 @@ func TestEdgeConfigValidate(t *testing.T) {
 	}{
 		{
 			name: "valid",
-			cfg: EdgeConfig{
-				PublicDomain:      "example.test",
-				EdgeDomain:        "edge.example.test",
-				ListenHTTPS:       ":443",
-				ListenHTTP:        ":80",
-				DataDir:           "/tmp/edge",
-				ClientCredentials: map[string][]string{"demo-token": {"demo.example.test"}},
-			},
+			cfg:  validEdgeConfig(),
 		},
 		{
 			name: "missing public domain",
-			cfg: EdgeConfig{
-				EdgeDomain:        "edge.example.test",
-				ListenHTTPS:       ":443",
-				ListenHTTP:        ":80",
-				DataDir:           "/tmp/edge",
-				ClientCredentials: map[string][]string{"demo-token": {"demo.example.test"}},
-			},
+			cfg: func() EdgeConfig {
+				cfg := validEdgeConfig()
+				cfg.PublicDomain = ""
+				return cfg
+			}(),
 			wantErr: "public_domain is required",
 		},
 		{
 			name: "missing edge domain",
-			cfg: EdgeConfig{
-				PublicDomain:      "example.test",
-				ListenHTTPS:       ":443",
-				ListenHTTP:        ":80",
-				DataDir:           "/tmp/edge",
-				ClientCredentials: map[string][]string{"demo-token": {"demo.example.test"}},
-			},
+			cfg: func() EdgeConfig {
+				cfg := validEdgeConfig()
+				cfg.EdgeDomain = ""
+				return cfg
+			}(),
 			wantErr: "edge_domain is required",
 		},
 		{
 			name: "missing listeners",
-			cfg: EdgeConfig{
-				PublicDomain:      "example.test",
-				EdgeDomain:        "edge.example.test",
-				DataDir:           "/tmp/edge",
-				ClientCredentials: map[string][]string{"demo-token": {"demo.example.test"}},
-			},
+			cfg: func() EdgeConfig {
+				cfg := validEdgeConfig()
+				cfg.ListenHTTPS = ""
+				cfg.ListenHTTP = ""
+				return cfg
+			}(),
 			wantErr: "listen_http and listen_https are required",
 		},
 		{
 			name: "missing data dir",
-			cfg: EdgeConfig{
-				PublicDomain:      "example.test",
-				EdgeDomain:        "edge.example.test",
-				ListenHTTPS:       ":443",
-				ListenHTTP:        ":80",
-				ClientCredentials: map[string][]string{"demo-token": {"demo.example.test"}},
-			},
+			cfg: func() EdgeConfig {
+				cfg := validEdgeConfig()
+				cfg.DataDir = ""
+				return cfg
+			}(),
 			wantErr: "data_dir is required",
 		},
 		{
-			name: "missing credentials",
-			cfg: EdgeConfig{
-				PublicDomain: "example.test",
-				EdgeDomain:   "edge.example.test",
-				ListenHTTPS:  ":443",
-				ListenHTTP:   ":80",
-				DataDir:      "/tmp/edge",
-			},
-			wantErr: "client_credentials must not be empty",
+			name: "missing auth key",
+			cfg: func() EdgeConfig {
+				cfg := validEdgeConfig()
+				cfg.AuthPublicKeyHex = ""
+				return cfg
+			}(),
+			wantErr: "invalid auth_public_key_hex",
+		},
+		{
+			name: "bad auth key hex",
+			cfg: func() EdgeConfig {
+				cfg := validEdgeConfig()
+				cfg.AuthPublicKeyHex = "zz"
+				return cfg
+			}(),
+			wantErr: "decode public key hex",
+		},
+		{
+			name: "wrong auth key size",
+			cfg: func() EdgeConfig {
+				cfg := validEdgeConfig()
+				cfg.AuthPublicKeyHex = "abcd"
+				return cfg
+			}(),
+			wantErr: "public key must be 32 bytes",
 		},
 		{
 			name: "tls pair mismatch",
-			cfg: EdgeConfig{
-				PublicDomain:      "example.test",
-				EdgeDomain:        "edge.example.test",
-				ListenHTTPS:       ":443",
-				ListenHTTP:        ":80",
-				DataDir:           "/tmp/edge",
-				TLSCertFile:       "edge.crt",
-				ClientCredentials: map[string][]string{"demo-token": {"demo.example.test"}},
-			},
+			cfg: func() EdgeConfig {
+				cfg := validEdgeConfig()
+				cfg.TLSCertFile = "edge.crt"
+				return cfg
+			}(),
 			wantErr: "tls_cert_file and tls_key_file must be provided together",
 		},
 		{
 			name: "negative per-session inflight limit",
-			cfg: EdgeConfig{
-				PublicDomain:          "example.test",
-				EdgeDomain:            "edge.example.test",
-				ListenHTTPS:           ":443",
-				ListenHTTP:            ":80",
-				DataDir:               "/tmp/edge",
-				MaxInflightPerSession: -1,
-				ClientCredentials:     map[string][]string{"demo-token": {"demo.example.test"}},
-			},
+			cfg: func() EdgeConfig {
+				cfg := validEdgeConfig()
+				cfg.MaxInflightPerSession = -1
+				return cfg
+			}(),
 			wantErr: "max_inflight_per_session must be greater than or equal to zero",
 		},
 		{
 			name: "negative total inflight limit",
-			cfg: EdgeConfig{
-				PublicDomain:      "example.test",
-				EdgeDomain:        "edge.example.test",
-				ListenHTTPS:       ":443",
-				ListenHTTP:        ":80",
-				DataDir:           "/tmp/edge",
-				MaxTotalInflight:  -1,
-				ClientCredentials: map[string][]string{"demo-token": {"demo.example.test"}},
-			},
+			cfg: func() EdgeConfig {
+				cfg := validEdgeConfig()
+				cfg.MaxTotalInflight = -1
+				return cfg
+			}(),
 			wantErr: "max_total_inflight must be greater than or equal to zero",
-		},
-		{
-			name: "empty token",
-			cfg: EdgeConfig{
-				PublicDomain:      "example.test",
-				EdgeDomain:        "edge.example.test",
-				ListenHTTPS:       ":443",
-				ListenHTTP:        ":80",
-				DataDir:           "/tmp/edge",
-				ClientCredentials: map[string][]string{"": {"demo.example.test"}},
-			},
-			wantErr: "client_credentials contains an empty token",
-		},
-		{
-			name: "empty host list",
-			cfg: EdgeConfig{
-				PublicDomain:      "example.test",
-				EdgeDomain:        "edge.example.test",
-				ListenHTTPS:       ":443",
-				ListenHTTP:        ":80",
-				DataDir:           "/tmp/edge",
-				ClientCredentials: map[string][]string{"demo-token": {}},
-			},
-			wantErr: `token "demo-token" must allow at least one hostname`,
-		},
-		{
-			name: "empty hostname",
-			cfg: EdgeConfig{
-				PublicDomain:      "example.test",
-				EdgeDomain:        "edge.example.test",
-				ListenHTTPS:       ":443",
-				ListenHTTP:        ":80",
-				DataDir:           "/tmp/edge",
-				ClientCredentials: map[string][]string{"demo-token": {"", "demo.example.test"}},
-			},
-			wantErr: `token "demo-token" contains an empty hostname`,
-		},
-		{
-			name: "duplicate hostname",
-			cfg: EdgeConfig{
-				PublicDomain:      "example.test",
-				EdgeDomain:        "edge.example.test",
-				ListenHTTPS:       ":443",
-				ListenHTTP:        ":80",
-				DataDir:           "/tmp/edge",
-				ClientCredentials: map[string][]string{"demo-token": {"demo.example.test", "demo.example.test"}},
-			},
-			wantErr: `token "demo-token" contains duplicate hostname "demo.example.test"`,
-		},
-		{
-			name: "hostname conflict across tokens",
-			cfg: EdgeConfig{
-				PublicDomain: "example.test",
-				EdgeDomain:   "edge.example.test",
-				ListenHTTPS:  ":443",
-				ListenHTTP:   ":80",
-				DataDir:      "/tmp/edge",
-				ClientCredentials: map[string][]string{
-					"demo-token":  {"demo.example.test"},
-					"other-token": {"demo.example.test"},
-				},
-			},
-			wantErr: `hostname "demo.example.test" assigned to both token`,
 		},
 	}
 
@@ -414,7 +293,7 @@ func TestEdgeConfigValidate(t *testing.T) {
 	}
 }
 
-func TestClientConfigValidateAndHostnames(t *testing.T) {
+func TestClientConfigValidateAndHelpers(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -424,87 +303,105 @@ func TestClientConfigValidateAndHostnames(t *testing.T) {
 	}{
 		{
 			name: "valid",
-			cfg: ClientConfig{
-				EdgeAddr:  "edge.example.test:443",
-				Token:     "demo-token",
-				DataDir:   "/tmp/client",
-				AcmeEmail: "ops@example.test",
-				Routes: map[string]string{
-					"z.example.test": "http://127.0.0.1:8080",
-					"a.example.test": "http://127.0.0.1:9000",
-				},
-			},
+			cfg:  validClientConfig(),
 		},
 		{
 			name: "missing edge addr",
-			cfg: ClientConfig{
-				Token:     "demo-token",
-				DataDir:   "/tmp/client",
-				AcmeEmail: "ops@example.test",
-				Routes:    map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
-			},
+			cfg: func() ClientConfig {
+				cfg := validClientConfig()
+				cfg.EdgeAddr = ""
+				return cfg
+			}(),
 			wantErr: "edge_addr is required",
 		},
 		{
-			name: "missing token",
-			cfg: ClientConfig{
-				EdgeAddr:  "edge.example.test:443",
-				DataDir:   "/tmp/client",
-				AcmeEmail: "ops@example.test",
-				Routes:    map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
-			},
-			wantErr: "token is required",
+			name: "missing signature",
+			cfg: func() ClientConfig {
+				cfg := validClientConfig()
+				cfg.SignatureHex = ""
+				return cfg
+			}(),
+			wantErr: "invalid signature_hex",
+		},
+		{
+			name: "bad signature hex",
+			cfg: func() ClientConfig {
+				cfg := validClientConfig()
+				cfg.SignatureHex = "zz"
+				return cfg
+			}(),
+			wantErr: "decode signature hex",
+		},
+		{
+			name: "wrong signature size",
+			cfg: func() ClientConfig {
+				cfg := validClientConfig()
+				cfg.SignatureHex = "abcd"
+				return cfg
+			}(),
+			wantErr: "signature must be 64 bytes",
 		},
 		{
 			name: "missing data dir",
-			cfg: ClientConfig{
-				EdgeAddr:  "edge.example.test:443",
-				Token:     "demo-token",
-				AcmeEmail: "ops@example.test",
-				Routes:    map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
-			},
+			cfg: func() ClientConfig {
+				cfg := validClientConfig()
+				cfg.DataDir = ""
+				return cfg
+			}(),
 			wantErr: "data_dir is required",
 		},
 		{
 			name: "missing acme email",
-			cfg: ClientConfig{
-				EdgeAddr: "edge.example.test:443",
-				Token:    "demo-token",
-				DataDir:  "/tmp/client",
-				Routes:   map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
-			},
+			cfg: func() ClientConfig {
+				cfg := validClientConfig()
+				cfg.AcmeEmail = ""
+				return cfg
+			}(),
 			wantErr: "acme_email is required",
 		},
 		{
 			name: "missing routes",
-			cfg: ClientConfig{
-				EdgeAddr:  "edge.example.test:443",
-				Token:     "demo-token",
-				DataDir:   "/tmp/client",
-				AcmeEmail: "ops@example.test",
-			},
+			cfg: func() ClientConfig {
+				cfg := validClientConfig()
+				cfg.Routes = nil
+				return cfg
+			}(),
 			wantErr: "routes must not be empty",
 		},
 		{
+			name: "multiple routes",
+			cfg: func() ClientConfig {
+				cfg := validClientConfig()
+				cfg.Routes["api.example.test"] = "http://127.0.0.1:9000"
+				return cfg
+			}(),
+			wantErr: "routes must contain exactly one hostname",
+		},
+		{
 			name: "empty hostname",
-			cfg: ClientConfig{
-				EdgeAddr:  "edge.example.test:443",
-				Token:     "demo-token",
-				DataDir:   "/tmp/client",
-				AcmeEmail: "ops@example.test",
-				Routes:    map[string]string{"": "http://127.0.0.1:8080"},
-			},
+			cfg: func() ClientConfig {
+				cfg := validClientConfig()
+				cfg.Routes = map[string]string{"": "http://127.0.0.1:8080"}
+				return cfg
+			}(),
 			wantErr: "routes contains an empty hostname",
 		},
 		{
+			name: "invalid hostname",
+			cfg: func() ClientConfig {
+				cfg := validClientConfig()
+				cfg.Routes = map[string]string{"localhost": "http://127.0.0.1:8080"}
+				return cfg
+			}(),
+			wantErr: "invalid route hostname",
+		},
+		{
 			name: "empty upstream",
-			cfg: ClientConfig{
-				EdgeAddr:  "edge.example.test:443",
-				Token:     "demo-token",
-				DataDir:   "/tmp/client",
-				AcmeEmail: "ops@example.test",
-				Routes:    map[string]string{"demo.example.test": ""},
-			},
+			cfg: func() ClientConfig {
+				cfg := validClientConfig()
+				cfg.Routes = map[string]string{"demo.example.test": ""}
+				return cfg
+			}(),
 			wantErr: `route "demo.example.test" has an empty upstream URL`,
 		},
 	}
@@ -518,8 +415,11 @@ func TestClientConfigValidateAndHostnames(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Validate() error = %v", err)
 				}
-				if got := tt.cfg.Hostnames(); len(got) == 2 && (got[0] != "a.example.test" || got[1] != "z.example.test") {
-					t.Fatalf("Hostnames() = %v, want sorted values", got)
+				if got := tt.cfg.Hostnames(); len(got) != 1 || got[0] != "demo.example.test" {
+					t.Fatalf("Hostnames() = %v, want [demo.example.test]", got)
+				}
+				if got := tt.cfg.Hostname(); got != "demo.example.test" {
+					t.Fatalf("Hostname() = %q, want %q", got, "demo.example.test")
 				}
 				return
 			}
@@ -527,6 +427,26 @@ func TestClientConfigValidateAndHostnames(t *testing.T) {
 				t.Fatalf("Validate() error = %v, want substring %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestConfigDecodeHelpers(t *testing.T) {
+	t.Parallel()
+
+	publicKey, err := validEdgeConfig().AuthPublicKey()
+	if err != nil {
+		t.Fatalf("AuthPublicKey() error = %v", err)
+	}
+	if len(publicKey) != ed25519.PublicKeySize {
+		t.Fatalf("len(publicKey) = %d, want %d", len(publicKey), ed25519.PublicKeySize)
+	}
+
+	signature, err := validClientConfig().Signature()
+	if err != nil {
+		t.Fatalf("Signature() error = %v", err)
+	}
+	if len(signature) != ed25519.SignatureSize {
+		t.Fatalf("len(signature) = %d, want %d", len(signature), ed25519.SignatureSize)
 	}
 }
 
@@ -541,6 +461,47 @@ func TestLoadErrors(t *testing.T) {
 	if _, err := LoadClientConfig(path); err == nil || !strings.Contains(err.Error(), "parse") {
 		t.Fatalf("LoadClientConfig(invalid) error = %v, want parse error", err)
 	}
+}
+
+func validEdgeConfig() EdgeConfig {
+	return EdgeConfig{
+		PublicDomain:      "example.test",
+		EdgeDomain:        "edge.example.test",
+		ListenHTTPS:       ":443",
+		ListenHTTP:        ":80",
+		DataDir:           "/tmp/edge",
+		AuthPublicKeyHex:  testPublicKeyHex(),
+		HandshakeTimeout:  Duration{Duration: time.Second},
+		HeartbeatInterval: Duration{Duration: 2 * time.Second},
+		HeartbeatTimeout:  Duration{Duration: 3 * time.Second},
+	}
+}
+
+func validClientConfig() ClientConfig {
+	return ClientConfig{
+		EdgeAddr:     "edge.example.test:443",
+		SignatureHex: testSignatureHex(),
+		DataDir:      "/tmp/client",
+		AcmeEmail:    "ops@example.test",
+		Routes: map[string]string{
+			"Demo.Example.Test.": "http://127.0.0.1:8080",
+		},
+	}
+}
+
+func testPublicKeyHex() string {
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	return auth.SignatureHex(privateKey.Public().(ed25519.PublicKey))
+}
+
+func testSignatureHex() string {
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	signature, err := auth.SignHostname(seed, "demo.example.test")
+	if err != nil {
+		panic(err)
+	}
+	return auth.SignatureHex(signature)
 }
 
 func writeTempYAML(t *testing.T, contents string) string {

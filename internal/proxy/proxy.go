@@ -37,7 +37,7 @@ func New(routes map[string]string, logger *slog.Logger) (*Router, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse upstream for %s: %w", host, err)
 		}
-		router.routes[strings.ToLower(host)] = &route{
+		router.routes[canonicalHost(host)] = &route{
 			target: target,
 			proxy:  buildProxy(target, logger.With("route_host", host)),
 		}

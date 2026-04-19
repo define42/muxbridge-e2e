@@ -27,6 +27,8 @@ type stubPerfTunnelClient struct {
 	runFunc   func(context.Context) error
 }
 
+const perfSignatureHex = "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+
 func (c *stubPerfTunnelClient) Run(ctx context.Context) error {
 	if c.runCalled != nil {
 		select {
@@ -68,7 +70,10 @@ func resetPerfRunHooks(t *testing.T) {
 func TestLoadConfigDerivesEdgeAddrAndDefaults(t *testing.T) {
 	t.Parallel()
 
-	cfg, err := loadConfig([]string{"--public-host", "Perf.Example.COM.", "--public-domain", "Example.COM."}, func(string) string {
+	cfg, err := loadConfig([]string{"--public-host", "Perf.Example.COM.", "--public-domain", "Example.COM."}, func(key string) string {
+		if key == "MUXBRIDGE_CLIENT_SIGNATURE_HEX" {
+			return perfSignatureHex
+		}
 		return ""
 	})
 	if err != nil {
@@ -84,8 +89,8 @@ func TestLoadConfigDerivesEdgeAddrAndDefaults(t *testing.T) {
 	if cfg.EdgeAddr != "edge.example.com:443" {
 		t.Fatalf("EdgeAddr = %q, want %q", cfg.EdgeAddr, "edge.example.com:443")
 	}
-	if cfg.Token != defaultPerfToken {
-		t.Fatalf("Token = %q, want %q", cfg.Token, defaultPerfToken)
+	if cfg.SignatureHex != perfSignatureHex {
+		t.Fatalf("SignatureHex = %q, want %q", cfg.SignatureHex, perfSignatureHex)
 	}
 	if cfg.Connections != defaultConnections {
 		t.Fatalf("Connections = %d, want %d", cfg.Connections, defaultConnections)
@@ -109,7 +114,7 @@ func TestLoadConfigUsesEnvAndFlags(t *testing.T) {
 
 	cfg, err := loadConfig([]string{
 		"--public-host", "flag.example.com",
-		"--token", "flag-token",
+		"--signature-hex", perfSignatureHex,
 		"--connections", "12",
 		"--duration", "45s",
 		"--scenario", "fast",
@@ -124,8 +129,8 @@ func TestLoadConfigUsesEnvAndFlags(t *testing.T) {
 			return " perf.example.com "
 		case "MUXBRIDGE_EDGE_ADDR":
 			return " edge.perf.example.com:443 "
-		case "MUXBRIDGE_CLIENT_TOKEN":
-			return " env-token "
+		case "MUXBRIDGE_CLIENT_SIGNATURE_HEX":
+			return strings.Repeat("2", 128)
 		case "MUXBRIDGE_DEBUG":
 			return "true"
 		default:
@@ -145,8 +150,8 @@ func TestLoadConfigUsesEnvAndFlags(t *testing.T) {
 	if cfg.EdgeAddr != "edge.perf.example.com:443" {
 		t.Fatalf("EdgeAddr = %q, want %q", cfg.EdgeAddr, "edge.perf.example.com:443")
 	}
-	if cfg.Token != "flag-token" {
-		t.Fatalf("Token = %q, want %q", cfg.Token, "flag-token")
+	if cfg.SignatureHex != perfSignatureHex {
+		t.Fatalf("SignatureHex = %q, want %q", cfg.SignatureHex, perfSignatureHex)
 	}
 	if cfg.Connections != 12 {
 		t.Fatalf("Connections = %d, want %d", cfg.Connections, 12)
@@ -226,7 +231,12 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := loadConfig(tc.args, func(string) string { return "" })
+			_, err := loadConfig(tc.args, func(key string) string {
+				if key == "MUXBRIDGE_CLIENT_SIGNATURE_HEX" {
+					return perfSignatureHex
+				}
+				return ""
+			})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("loadConfig() error = %v, want %q", err, tc.want)
 			}
@@ -863,6 +873,7 @@ func TestRunReturnsReadinessErrorWhenContextCanceled(t *testing.T) {
 	err := run(ctx, []string{
 		"--public-host", "perf.example.com",
 		"--edge-addr", "127.0.0.1:1",
+		"--signature-hex", perfSignatureHex,
 	}, func(string) string { return "" })
 	if err == nil || !strings.Contains(err.Error(), "did not become ready") {
 		t.Fatalf("run() error = %v, want readiness failure", err)
@@ -883,8 +894,8 @@ func TestRunSuccessUsesTunnelAndLoadRunner(t *testing.T) {
 		if cfg.EdgeAddr != "edge.example.com:443" {
 			t.Fatalf("EdgeAddr = %q, want %q", cfg.EdgeAddr, "edge.example.com:443")
 		}
-		if cfg.Token != "perf-token" {
-			t.Fatalf("Token = %q, want %q", cfg.Token, "perf-token")
+		if cfg.SignatureHex != perfSignatureHex {
+			t.Fatalf("SignatureHex = %q, want %q", cfg.SignatureHex, perfSignatureHex)
 		}
 		if cfg.Handler == nil {
 			t.Fatal("Handler = nil, want perf mux")
@@ -960,7 +971,7 @@ func TestRunSuccessUsesTunnelAndLoadRunner(t *testing.T) {
 		"--public-host", "perf.example.com",
 		"--public-domain", "example.com",
 		"--edge-addr", "edge.example.com:443",
-		"--token", "perf-token",
+		"--signature-hex", perfSignatureHex,
 		"--scenario", "fast",
 		"--connections", "3",
 		"--duration", "2s",
@@ -1056,6 +1067,7 @@ func TestRunDisablesKeepAlivesWhenProbeFails(t *testing.T) {
 		"--public-host", "perf.example.com",
 		"--public-domain", "example.com",
 		"--edge-addr", "edge.example.com:443",
+		"--signature-hex", perfSignatureHex,
 	}, func(string) string { return "" })
 	if err != nil {
 		t.Fatalf("run() error = %v", err)
@@ -1095,6 +1107,7 @@ func TestRunReturnsLoadErrorAndStopsTunnel(t *testing.T) {
 		"--public-host", "perf.example.com",
 		"--public-domain", "example.com",
 		"--edge-addr", "edge.example.com:443",
+		"--signature-hex", perfSignatureHex,
 	}, func(string) string { return "" })
 	if err == nil || !strings.Contains(err.Error(), "load boom") {
 		t.Fatalf("run() error = %v, want load boom", err)
@@ -1142,6 +1155,7 @@ func TestRunReturnsReadinessErrorAndStopsTunnel(t *testing.T) {
 		"--public-domain", "example.com",
 		"--edge-addr", "edge.example.com:443",
 		"--debug",
+		"--signature-hex", perfSignatureHex,
 	}, func(string) string { return "" })
 	if err == nil || !strings.Contains(err.Error(), "did not become ready") || !strings.Contains(err.Error(), "not ready") {
 		t.Fatalf("run() error = %v, want readiness failure", err)
@@ -1164,6 +1178,7 @@ func TestRunReturnsTunnelClientCreationError(t *testing.T) {
 		"--public-host", "perf.example.com",
 		"--public-domain", "example.com",
 		"--edge-addr", "edge.example.com:443",
+		"--signature-hex", perfSignatureHex,
 	}, func(string) string { return "" })
 	if err == nil || !strings.Contains(err.Error(), "new tunnel boom") {
 		t.Fatalf("run() error = %v, want new tunnel boom", err)

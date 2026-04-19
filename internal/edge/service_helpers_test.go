@@ -1,7 +1,9 @@
 package edge
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -17,6 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/define42/muxbridge-e2e/internal/auth"
 	"github.com/define42/muxbridge-e2e/internal/config"
 	"github.com/define42/muxbridge-e2e/internal/control"
 	controlpb "github.com/define42/muxbridge-e2e/proto"
@@ -26,31 +29,37 @@ func TestAuthorizeRegistration(t *testing.T) {
 	t.Parallel()
 
 	service := New(config.EdgeConfig{
-		EdgeDomain: "edge.example.test",
-		ClientCredentials: map[string][]string{
-			"demo-token": {"Demo.Example.Test", "API.EXAMPLE.TEST"},
-		},
+		EdgeDomain:       "edge.example.test",
+		AuthPublicKeyHex: testEdgePublicKeyHex(),
 	}, Options{})
 
-	hostnames, err := service.authorizeRegistration(&controlpb.RegisterRequest{
-		Token:     "demo-token",
-		Hostnames: []string{"api.example.test", "demo.example.test"},
+	hostname, authKey, err := service.authorizeRegistration(&controlpb.RegisterRequest{
+		Hostname:  "Demo.Example.Test.",
+		Signature: mustSignEdgeHostname(t, "demo.example.test"),
 	})
 	if err != nil {
 		t.Fatalf("authorizeRegistration() error = %v", err)
 	}
-	if want := []string{"api.example.test", "demo.example.test"}; !slicesEqual(hostnames, want) {
-		t.Fatalf("authorizeRegistration() = %v, want %v", hostnames, want)
+	if hostname != "demo.example.test" {
+		t.Fatalf("authorizeRegistration() hostname = %q, want %q", hostname, "demo.example.test")
 	}
-
-	if _, err := service.authorizeRegistration(&controlpb.RegisterRequest{Token: "missing"}); err == nil || !strings.Contains(err.Error(), "unknown client token") {
-		t.Fatalf("authorizeRegistration(missing) error = %v, want unknown token", err)
+	if authKey != testEdgeSignatureHex("demo.example.test") {
+		t.Fatalf("authorizeRegistration() authKey = %q, want %q", authKey, testEdgeSignatureHex("demo.example.test"))
 	}
-	if _, err := service.authorizeRegistration(&controlpb.RegisterRequest{
-		Token:     "demo-token",
-		Hostnames: []string{"other.example.test"},
-	}); err == nil || !strings.Contains(err.Error(), "exactly match") {
-		t.Fatalf("authorizeRegistration(mismatch) error = %v, want exact match error", err)
+	if _, _, err := service.authorizeRegistration(&controlpb.RegisterRequest{Hostname: "missing.example.test", Signature: []byte{1, 2, 3}}); err == nil || !strings.Contains(err.Error(), "signature must be 64 bytes") {
+		t.Fatalf("authorizeRegistration(short signature) error = %v, want size error", err)
+	}
+	if _, _, err := service.authorizeRegistration(&controlpb.RegisterRequest{
+		Hostname:  "other.example.test",
+		Signature: mustSignEdgeHostname(t, "demo.example.test"),
+	}); err == nil || !strings.Contains(err.Error(), "invalid hostname signature") {
+		t.Fatalf("authorizeRegistration(mismatch) error = %v, want invalid signature", err)
+	}
+	if _, _, err := service.authorizeRegistration(&controlpb.RegisterRequest{
+		Hostname:  "edge.example.test",
+		Signature: mustSignEdgeHostname(t, "edge.example.test"),
+	}); err == nil || !strings.Contains(err.Error(), "must not equal edge_domain") {
+		t.Fatalf("authorizeRegistration(edge domain) error = %v, want reserved hostname error", err)
 	}
 }
 
@@ -66,7 +75,7 @@ func TestEdgeHTTPHandlerAndPublicHTTPHandler(t *testing.T) {
 	service.httpListener = stubListener{addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}}
 
 	session := &clientSession{
-		token:     "demo-token",
+		authKey:   "demo-token",
 		hostnames: []string{"demo.example.test"},
 		registry:  service.registry,
 		closed:    make(chan struct{}),
@@ -258,7 +267,7 @@ func TestRunControlLoopHeartbeatsAndUnexpectedMessage(t *testing.T) {
 	_, muxSession := newYamuxPair(t)
 	session := &clientSession{
 		id:            "session-1",
-		token:         "demo-token",
+		authKey:       "demo-token",
 		mux:           muxSession,
 		controlStream: serverConn,
 		controlWriter: control.NewLockedWriter(serverConn),
@@ -312,7 +321,7 @@ func TestRunControlLoopTimesOutSilentPeer(t *testing.T) {
 	_, muxSession := newYamuxPair(t)
 	session := &clientSession{
 		id:            "session-timeout",
-		token:         "demo-token",
+		authKey:       "demo-token",
 		mux:           muxSession,
 		controlStream: serverConn,
 		controlWriter: control.NewLockedWriter(serverConn),
@@ -350,26 +359,24 @@ func TestHandleControlConnRejectsInvalidRegistrations(t *testing.T) {
 			wantMessage: "first control frame must be register_request",
 		},
 		{
-			name: "unknown token",
+			name: "invalid signature",
 			firstFrame: &controlpb.Envelope{
 				Message: &controlpb.Envelope_RegisterRequest{
 					RegisterRequest: &controlpb.RegisterRequest{
-						Token:     "missing",
-						Hostnames: []string{"demo.example.test"},
+						Hostname:  "demo.example.test",
+						Signature: []byte{1, 2, 3},
 					},
 				},
 			},
 			wantAccept:  false,
-			wantMessage: "unknown client token",
+			wantMessage: "signature must be 64 bytes",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			service := New(config.EdgeConfig{
-				ClientCredentials: map[string][]string{
-					"demo-token": {"demo.example.test"},
-				},
+				AuthPublicKeyHex:  testEdgePublicKeyHex(),
 				HeartbeatInterval: config.Duration{Duration: 10 * time.Millisecond},
 				HeartbeatTimeout:  config.Duration{Duration: 30 * time.Millisecond},
 			}, Options{Registerer: prometheus.NewRegistry()})
@@ -419,9 +426,7 @@ func TestHandleControlConnRegistersSession(t *testing.T) {
 	t.Parallel()
 
 	service := New(config.EdgeConfig{
-		ClientCredentials: map[string][]string{
-			"demo-token": {"demo.example.test"},
-		},
+		AuthPublicKeyHex:  testEdgePublicKeyHex(),
 		HeartbeatInterval: config.Duration{Duration: 10 * time.Millisecond},
 		HeartbeatTimeout:  config.Duration{Duration: 30 * time.Millisecond},
 	}, Options{Registerer: prometheus.NewRegistry()})
@@ -450,9 +455,8 @@ func TestHandleControlConnRegistersSession(t *testing.T) {
 	if err := control.WriteEnvelope(stream, &controlpb.Envelope{
 		Message: &controlpb.Envelope_RegisterRequest{
 			RegisterRequest: &controlpb.RegisterRequest{
-				Token:     "demo-token",
-				Hostnames: []string{"demo.example.test"},
-				SessionId: "session-1",
+				Hostname:  "demo.example.test",
+				Signature: mustSignEdgeHostname(t, "demo.example.test"),
 			},
 		},
 	}); err != nil {
@@ -495,9 +499,6 @@ func TestHandleHTTPSConnRejectsPerSessionInflightLimit(t *testing.T) {
 	service := New(config.EdgeConfig{
 		EdgeDomain:            "edge.example.test",
 		MaxInflightPerSession: 1,
-		ClientCredentials: map[string][]string{
-			"demo-token": {"demo.example.test"},
-		},
 	}, Options{Registerer: prometheus.NewRegistry()})
 
 	session, peer := newActiveServiceSession(t, service, "demo-token", "demo.example.test")
@@ -579,10 +580,6 @@ func TestHandleHTTPSConnRejectsTotalInflightLimit(t *testing.T) {
 	service := New(config.EdgeConfig{
 		EdgeDomain:       "edge.example.test",
 		MaxTotalInflight: 1,
-		ClientCredentials: map[string][]string{
-			"demo-token": {"demo.example.test"},
-			"api-token":  {"api.example.test"},
-		},
 	}, Options{Registerer: prometheus.NewRegistry()})
 
 	sessionOne, peerOne := newActiveServiceSession(t, service, "demo-token", "demo.example.test")
@@ -714,7 +711,7 @@ func newActiveServiceSession(t *testing.T, service *Service, token, hostname str
 	controlStream := &bufferCloser{}
 	session := &clientSession{
 		id:            hostname,
-		token:         token,
+		authKey:       token,
 		hostnames:     []string{hostname},
 		mux:           muxSession,
 		controlStream: controlStream,
@@ -761,10 +758,11 @@ func TestStartCleansUpServersWhenCertificateManagementFails(t *testing.T) {
 
 	issueErr := errors.New("issuer failed")
 	service := New(config.EdgeConfig{
-		DataDir:     t.TempDir(),
-		EdgeDomain:  "edge.example.test",
-		ListenHTTPS: "127.0.0.1:0",
-		ListenHTTP:  "127.0.0.1:0",
+		DataDir:          t.TempDir(),
+		EdgeDomain:       "edge.example.test",
+		ListenHTTPS:      "127.0.0.1:0",
+		ListenHTTP:       "127.0.0.1:0",
+		AuthPublicKeyHex: testEdgePublicKeyHex(),
 	}, Options{
 		Registerer: prometheus.NewRegistry(),
 		CertIssuerFactory: func(*certmagic.Config) certmagic.Issuer {
@@ -793,6 +791,32 @@ func TestStartCleansUpServersWhenCertificateManagementFails(t *testing.T) {
 	if err := service.Close(closeCtx); err != nil {
 		t.Fatalf("Close() after failed Start = %v", err)
 	}
+}
+
+func testEdgePublicKeyHex() string {
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	return auth.SignatureHex(privateKey.Public().(ed25519.PublicKey))
+}
+
+func testEdgeSignatureHex(hostname string) string {
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	signature, err := auth.SignHostname(seed, hostname)
+	if err != nil {
+		panic(err)
+	}
+	return auth.SignatureHex(signature)
+}
+
+func mustSignEdgeHostname(t *testing.T, hostname string) []byte {
+	t.Helper()
+
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	signature, err := auth.SignHostname(seed, hostname)
+	if err != nil {
+		t.Fatalf("SignHostname(%q) error = %v", hostname, err)
+	}
+	return signature
 }
 
 func slicesEqual(got, want []string) bool {

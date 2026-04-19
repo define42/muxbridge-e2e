@@ -24,7 +24,5 @@ max_total_inflight: 512
 # Optional. Expose Go pprof handlers on https://edge_domain/pprof/... only when true.
 debug: false
 
-client_credentials:
-  demo-token:
-    - demo.example.com
-    - api.demo.example.com
+# Required. Raw 32-byte Ed25519 public key, hex-encoded.
+auth_public_key_hex: "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"

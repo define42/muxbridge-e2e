@@ -21,7 +21,7 @@ Browser --TLS--> edge (public :443)
 ```
 
 1. `client` dials `edge` over a long-lived TLS connection, negotiating ALPN `muxbridge-control/1`. Inside that connection, yamux carries control messages and one raw byte stream per public TCP connection.
-2. `client` sends a `RegisterRequest` (token, hostnames from its `routes`, session id). `edge` checks the token against `client_credentials` and verifies that the requested hostnames match **exactly**. On success, `edge` returns heartbeat parameters.
+2. `client` sends a `RegisterRequest` with one hostname plus an Ed25519 signature. `edge` verifies the hostname claim with its configured public key and, on success, returns heartbeat parameters.
 3. A browser connects to `edge:443`. `edge` reads TLS records until the ClientHello is fully parsed (up to 64 KiB), then inspects SNI.
 4. If SNI matches `edge_domain`, `edge` terminates TLS locally. Otherwise, if the hostname is owned by a registered `client`, `edge` opens a new yamux stream to that client, writes a protobuf `StreamHeader` (hostname, remote addr, timestamp), and relays the raw TCP bytes bidirectionally. Missing SNI, unparseable ClientHellos, and unknown hostnames close the connection with no HTTP error page.
 5. `client` reads the stream header, then treats the stream like a `net.Conn`, finishing the TLS handshake with its own certificate. Decrypted requests are routed by exact hostname to the configured local origin (HTTP/HTTPS), with `X-Forwarded-For`, `X-Forwarded-Proto=https`, and `X-Forwarded-Host` set and `Host` preserved. WebSocket upgrades and streaming bodies are supported.
@@ -62,13 +62,11 @@ max_total_inflight: 512
 # Optional. Expose Go pprof handlers on https://edge_domain/pprof/... only when true.
 debug: false
 
-client_credentials:
-  demo-token:
-    - demo.example.com
-    - api.demo.example.com
+# Required. Raw 32-byte Ed25519 public key, hex-encoded.
+auth_public_key_hex: "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"
 ```
 
-A hostname may appear under only one token. A client's registered hostnames must exactly equal the hostnames listed for its token (same set, order-independent).
+`edge` verifies every registration with `auth_public_key_hex`. There is no edge-side token list or hostname allowlist anymore.
 When the edge manages its own certificate via CertMagic, `acme_email` becomes the ACME account contact for `edge_domain`.
 
 `max_inflight_per_session` limits how many active tunneled public connections / yamux data streams a single connected client session may hold at once. `max_total_inflight` caps the total number of active tunneled public connections / yamux data streams across the whole edge. These caps apply to tunneled TLS/TCP traffic only; the edge still does not decrypt requests, so one HTTP/2 connection counts as one active stream even if it carries many requests. When a cap is reached, the edge rejects the new public connection before opening a tunnel stream, using a best-effort TCP reset or plain close rather than returning HTTP `503`.
@@ -103,7 +101,7 @@ The endpoints are only mounted when debug mode is enabled and return `404` other
 
 ```yaml
 edge_addr: "edge.example.com:443"
-token: "demo-token"
+signature_hex: "709b40665c0788fbbc5aeb4f8c7b293b7bdcb138c916436999eb81d453881b78bcaa85d4c92d2af0e63b145c78f8e680a784515b15f20f2de2cac13f4b9c0809"
 data_dir: "/var/lib/muxbridge-e2e-client"
 acme_email: "ops@example.com"
 
@@ -113,15 +111,29 @@ reconnect_max: "30s"
 
 routes:
   demo.example.com: "http://127.0.0.1:8080"
-  api.demo.example.com: "http://127.0.0.1:9000"
 ```
 
-`client` obtains certificates for each route hostname via CertMagic. HTTP-01 is disabled; TLS-ALPN-01 is used, which works because `edge` forwards `acme-tls/1` ClientHellos unchanged. `data_dir` must be writable and persistent for ACME account and cert storage.
+`client` registers exactly one hostname. `signature_hex` must be the Ed25519 signature for that normalized hostname (`lowercase`, no trailing dot). `client` obtains certificates for its route hostname via CertMagic. HTTP-01 is disabled; TLS-ALPN-01 is used, which works because `edge` forwards `acme-tls/1` ClientHellos unchanged. `data_dir` must be writable and persistent for ACME account and cert storage.
+
+### Signing Tool
+
+Generate a client-ready hostname signature with the built-in helper:
+
+```bash
+export MUXBRIDGE_ED25519_PRIVATE_SEED_HEX=4242424242424242424242424242424242424242424242424242424242424242
+./bin/sign-domain -domain demo.example.com
+```
+
+The tool prints a lowercase hex signature to stdout. The private seed is the raw 32-byte Ed25519 seed in hex. The matching public key for the sample seed above is:
+
+```text
+2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12
+```
 
 ## Build & Run
 
 ```bash
-make build          # produces bin/edge, bin/client, bin/perf-client, and bin/embedded_client
+make build          # produces bin/edge, bin/client, bin/perf-client, bin/embedded_client, and bin/sign-domain
 make test           # full suite (see also: make unit, make integration, make lint)
 make run-edge       # runs edge with examples/edge.yaml
 make run-client     # runs client with examples/client.yaml
@@ -151,17 +163,14 @@ The load generator keeps a configurable number of workers active for the full te
 
 Unlike the normal YAML-driven client, the perf client generates a self-signed certificate for the public hostname at startup and teaches its own load generator to trust it. That keeps the tool self-contained: no `data_dir`, ACME account, or static certificate files are required. The generated certificate is intended for the built-in load traffic, not for general browser trust.
 
-Configure the edge with the exact public hostname you want to benchmark:
+Configure the edge with the signer public key and generate a signature for the benchmark hostname:
 
 ```yaml
-client_credentials:
-  perf-token:
-    - perf.example.com
+auth_public_key_hex: "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"
 ```
 
 Defaults:
 
-- token: `perf-token`
 - connections: `1000`
 - duration: `30s`
 - scenario: `mixed`
@@ -181,7 +190,7 @@ The default `mixed` scenario spends most requests on `/fast`, adds a smaller amo
 --public-host
 --public-domain
 --edge-addr
---token
+--signature-hex
 --connections
 --duration
 --scenario
@@ -196,19 +205,19 @@ The default `mixed` scenario spends most requests on `/fast`, adds a smaller amo
 MUXBRIDGE_PUBLIC_HOST
 MUXBRIDGE_PUBLIC_DOMAIN
 MUXBRIDGE_EDGE_ADDR
-MUXBRIDGE_CLIENT_TOKEN
+MUXBRIDGE_CLIENT_SIGNATURE_HEX
 MUXBRIDGE_DEBUG
 ```
 
 ### Run The Perf Client
 
-With the matching edge credential and DNS pointing `perf.example.com` at the edge, run:
+With the matching edge public key, a hostname signature, and DNS pointing `perf.example.com` at the edge, run:
 
 ```bash
 ./bin/perf-client \
   --public-domain example.com \
   --public-host perf.example.com \
-  --token perf-token \
+  --signature-hex 420e6d594a7334a1a22e572c2d733ea86ae2dc7838dd428e3ac8630a99b37f6554e325f5c388b16e21af749d9cbc866bfa0c4602026f7daa50395d78ef5f2901 \
   --connections 1000 \
   --duration 30s \
   --scenario mixed
@@ -263,12 +272,12 @@ func main() {
 	defer stop()
 
 	client, err := tunnel.New(tunnel.Config{
-		EdgeAddr:  "edge.example.com:443",
-		Token:     "my-secret-token",
-		Hostnames: []string{"app.example.com"},
-		Handler:   mux,
-		DataDir:   "/var/lib/myapp/certs",
-		AcmeEmail: "ops@example.com",
+		EdgeAddr:     "edge.example.com:443",
+		SignatureHex: "709b40665c0788fbbc5aeb4f8c7b293b7bdcb138c916436999eb81d453881b78bcaa85d4c92d2af0e63b145c78f8e680a784515b15f20f2de2cac13f4b9c0809",
+		Hostnames:    []string{"app.example.com"},
+		Handler:      mux,
+		DataDir:      "/var/lib/myapp/certs",
+		AcmeEmail:    "ops@example.com",
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -285,9 +294,9 @@ func main() {
 | Field | Required | Description |
 |---|---|---|
 | `EdgeAddr` | yes | `host:port` of the edge server |
-| `Token` | yes | Authentication token (must match `client_credentials` on the edge) |
+| `SignatureHex` | yes | Hex-encoded Ed25519 signature for the registered hostname |
 | `Handler` | yes | `http.Handler` that receives decrypted requests |
-| `Hostnames` | yes | Hostnames to register (must exactly match the token's allowed set) |
+| `Hostnames` | yes | Hostnames to register (exactly one) |
 | `DataDir` | yes* | Writable dir for ACME cert/account storage (*not required when `TLSConfig` is set) |
 | `AcmeEmail` | no | Contact email for ACME issuance |
 | `TLSConfig` | no | Custom `*tls.Config` for TLS termination (bypasses ACME) |
@@ -361,7 +370,7 @@ networks:
     driver: bridge
 ```
 
-For Compose, point the client routes at service names instead of `127.0.0.1`, for example `demo.example.com: "http://demo:8080"` and `api.demo.example.com: "http://api:9000"`. Keeping `edge_addr: "edge.example.com:443"` works here because the `edge` service advertises `edge.example.com` as a network alias.
+For Compose, point the client route at a service name instead of `127.0.0.1`, for example `demo.example.com: "http://demo:8080"`. Keeping `edge_addr: "edge.example.com:443"` works here because the `edge` service advertises `edge.example.com` as a network alias.
 
 ## Runtime Behavior
 
@@ -382,7 +391,7 @@ For Compose, point the client routes at service names instead of `127.0.0.1`, fo
 
 ### Session Lifecycle
 
-- One `client` session per token. Registering a new session for a token that already has one replaces the older session: the old session receives a `DrainNotice` (`SESSION_REPLACED`), new streams route to the new session immediately, and old in-flight streams are given `replace_grace_period` to finish before the old session is closed.
+- One `client` session per verified signature. Registering a new session with the same signature replaces the older session: the old session receives a `DrainNotice` (`SESSION_REPLACED`), new streams route to the new session immediately, and old in-flight streams are given `replace_grace_period` to finish before the old session is closed.
 - Heartbeats run in both directions using the interval/timeout the `edge` returns in `RegisterResponse`. If the `edge` sees no heartbeat within `heartbeat_timeout`, it closes the session (`muxbridge_edge_heartbeats_missed_total`). If the `client` sees no ack within the same timeout, its reconnect loop restarts.
 - On shutdown, `edge` sends `DrainNotice` (`SERVER_SHUTDOWN`) to all sessions and waits up to `replace_grace_period` for in-flight streams.
 - `client` reconnects with exponential backoff between `reconnect_min` and `reconnect_max`, except after `SESSION_REPLACED` — that stops the reconnect loop permanently.
@@ -421,12 +430,12 @@ Logs are structured JSON (`slog`) and limited to connection metadata: hostname, 
 - `edge` cannot decrypt tunneled traffic. It peeks the ClientHello (first TLS records only) and otherwise forwards bytes verbatim.
 - Routing is exact-host in v1; there is no wildcard matching.
 - Missing SNI, malformed ClientHellos, and unknown hostnames close the TCP connection with no HTTP error page.
-- A hostname belongs to at most one active session at a time; token-hostname mapping is validated at config load.
+- A hostname belongs to at most one active session at a time. The edge does not keep a hostname allowlist; it only verifies Ed25519-signed hostname claims.
 - ECH, HTTP/3 / QUIC, wildcard ACME certificates, and edge-generated error pages for tunneled hostnames are out of scope for v1.
 
 ## Repository
 
-- `cmd/edge`, `cmd/client`, `cmd/perf-client` — binary entry points.
+- `cmd/edge`, `cmd/client`, `cmd/perf-client`, `cmd/sign-domain` — binary entry points.
 - `internal/edge` — accept loop, session registry, metrics, control server.
 - `internal/client` — dial/reconnect loop, yamux client, per-stream reverse proxy.
 - `internal/sni` — ClientHello peek/parse with replay buffer.
