@@ -6,17 +6,19 @@ EDGE_CONFIG ?= examples/edge.yaml
 CLIENT_CONFIG ?= examples/client.yaml
 GOLANGCI_LINT_VERSION ?= v2.11.4
 
-.PHONY: all build proto edge client embedded_client check-tunnel test unit integration fmt tidy lint clean run-edge run-client help
+.PHONY: all build proto edge client perf-client embedded_client check-tunnel test unit integration fmt tidy lint clean run-edge run-client help
 
 all: build
 
-build: edge client embedded_client check-tunnel
+build: edge client perf-client embedded_client check-tunnel
 
 proto: $(PROTO_GEN)
 
 edge: $(BIN_DIR)/edge
 
 client: $(BIN_DIR)/client
+
+perf-client: $(BIN_DIR)/perf-client
 
 embedded_client: $(BIN_DIR)/embedded_client
 
@@ -31,6 +33,9 @@ $(BIN_DIR)/edge: $(PROTO_GEN) $(GO_SOURCES) | $(BIN_DIR)
 
 $(BIN_DIR)/client: $(PROTO_GEN) $(GO_SOURCES) | $(BIN_DIR)
 	go build -trimpath -o $@ ./cmd/client
+
+$(BIN_DIR)/perf-client: $(PROTO_GEN) $(GO_SOURCES) | $(BIN_DIR)
+	go build -trimpath -o $@ ./cmd/perf-client
 
 $(BIN_DIR)/embedded_client: $(PROTO_GEN) $(GO_SOURCES) | $(BIN_DIR)
 	go build -trimpath -o $@ ./cmd/embedded_client
@@ -69,7 +74,8 @@ run-client:
 help:
 	@printf '%s\n' \
 		'Available targets:' \
-		'  make build          Build edge, client, and embedded_client binaries into $(BIN_DIR)/' \
+		'  make build          Build edge, client, perf-client, and embedded_client binaries into $(BIN_DIR)/' \
+		'  make perf-client    Build the perf-client binary into $(BIN_DIR)/' \
 		'  make embedded_client Build the embedded_client binary into $(BIN_DIR)/' \
 		'  make check-tunnel   Verify tunnel library compiles' \
 		'  make proto          Regenerate protobuf bindings from $(PROTO)' \

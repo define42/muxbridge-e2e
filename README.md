@@ -114,7 +114,7 @@ routes:
 ## Build & Run
 
 ```bash
-make build          # produces bin/edge and bin/client
+make build          # produces bin/edge, bin/client, bin/perf-client, and bin/embedded_client
 make test           # full suite (see also: make unit, make integration, make lint)
 make run-edge       # runs edge with examples/edge.yaml
 make run-client     # runs client with examples/client.yaml
@@ -128,6 +128,107 @@ Direct invocation:
 ```
 
 A real deployment also needs: DNS for `edge_domain` and every tunneled hostname pointing at the public `edge`, public reachability on `:80` and `:443`, a writable `data_dir` on the `client` for CertMagic state, and a writable `data_dir` on the `edge` too if it manages `edge_domain` via CertMagic.
+
+## Performance Client
+
+The perf client serves a purpose-built benchmark app locally through the tunnel and then drives load against the real public hostname. It is meant for end-to-end edge+tunnel+backend measurements rather than synthetic localhost-only benchmarking.
+
+Routes served by the perf app:
+
+- `/healthz` -> readiness probe used before the load phase starts
+- `/fast` -> small fixed plain-text response
+- `/bytes` -> fixed-size binary payload response
+- `/stream` -> chunked streaming response
+
+The load generator keeps a configurable number of workers active for the full test duration. Each worker owns its own HTTP client and keeps traffic on HTTP/1.1 so the test uses real parallel public connections instead of collapsing onto a single HTTP/2 session.
+
+Unlike the normal YAML-driven client, the perf client generates a self-signed certificate for the public hostname at startup and teaches its own load generator to trust it. That keeps the tool self-contained: no `data_dir`, ACME account, or static certificate files are required. The generated certificate is intended for the built-in load traffic, not for general browser trust.
+
+Configure the edge with the exact public hostname you want to benchmark:
+
+```yaml
+client_credentials:
+  perf-token:
+    - perf.example.com
+```
+
+Defaults:
+
+- token: `perf-token`
+- connections: `1000`
+- duration: `30s`
+- scenario: `mixed`
+- edge address: `edge.<public-domain>:443` when `--edge-addr` is not provided
+
+### Scenarios
+
+- `fast` -> every request goes to `/fast`
+- `stream` -> every request goes to `/stream`
+- `mixed` -> weighted mix of `/fast`, `/bytes`, and `/stream`
+
+The default `mixed` scenario spends most requests on `/fast`, adds a smaller amount of fixed-size `/bytes` traffic, and keeps a small stream workload in the mix.
+
+### Flags
+
+```text
+--public-host
+--public-domain
+--edge-addr
+--token
+--connections
+--duration
+--scenario
+--request-timeout
+--ready-timeout
+--debug
+```
+
+### Environment Variables
+
+```text
+MUXBRIDGE_PUBLIC_HOST
+MUXBRIDGE_PUBLIC_DOMAIN
+MUXBRIDGE_EDGE_ADDR
+MUXBRIDGE_CLIENT_TOKEN
+MUXBRIDGE_DEBUG
+```
+
+### Run The Perf Client
+
+With the matching edge credential and DNS pointing `perf.example.com` at the edge, run:
+
+```bash
+./bin/perf-client \
+  --public-domain example.com \
+  --public-host perf.example.com \
+  --token perf-token \
+  --connections 1000 \
+  --duration 30s \
+  --scenario mixed
+```
+
+The client waits for `https://perf.example.com/healthz` to return `200 OK`, then keeps roughly 1000 HTTP/1.1 public connections active for the configured duration and prints request throughput, response throughput, status counts, and latency percentiles.
+
+The summary includes:
+
+- total requests, successful responses, and request errors
+- response status counts
+- requests per second and bytes per second
+- latency min, average, p50, p95, p99, and max
+
+Example:
+
+```text
+performance test summary
+host: perf.example.com
+scenario: mixed
+connections: 1000
+duration: planned=30s observed=30.017s
+requests: total=48211 success=48211 errors=0
+throughput: req/s=1606.20 bytes/s=12483011.44
+latency: min=3.411ms avg=18.772ms p50=12ms p95=49ms p99=87ms max=214.118ms
+statuses: 200=48211
+```
 
 ## Client Library
 
@@ -318,7 +419,7 @@ Logs are structured JSON (`slog`) and limited to connection metadata: hostname, 
 
 ## Repository
 
-- `cmd/edge`, `cmd/client` — binary entry points.
+- `cmd/edge`, `cmd/client`, `cmd/perf-client` — binary entry points.
 - `internal/edge` — accept loop, session registry, metrics, control server.
 - `internal/client` — dial/reconnect loop, yamux client, per-stream reverse proxy.
 - `internal/sni` — ClientHello peek/parse with replay buffer.
