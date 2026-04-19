@@ -3,16 +3,22 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -295,6 +301,78 @@ func TestStartWaitAndClose(t *testing.T) {
 	}
 }
 
+func TestEnsureManagedSyncAndAsyncWithoutHostnames(t *testing.T) {
+	t.Parallel()
+
+	syncService := &Service{
+		cfg:         config.ClientConfig{},
+		certManager: newClientCertManager(t.TempDir(), "ops@example.test", nil),
+		logger:      slogDiscard(),
+	}
+	if err := syncService.ensureManagedSync(context.Background()); err != nil {
+		t.Fatalf("ensureManagedSync() error = %v", err)
+	}
+
+	asyncService := &Service{
+		cfg:         config.ClientConfig{},
+		certManager: newClientCertManager(t.TempDir(), "ops@example.test", nil),
+		logger:      slogDiscard(),
+	}
+	asyncService.ensureManagedAsync(context.Background())
+}
+
+func TestOpenLoopbackConn(t *testing.T) {
+	t.Parallel()
+
+	svc := &Service{}
+	if _, err := svc.openLoopbackConn("192.0.2.50:443"); err == nil || err.Error() != "loopback listener not initialized" {
+		t.Fatalf("openLoopbackConn() error = %v, want missing listener", err)
+	}
+
+	baseListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer func() { _ = baseListener.Close() }()
+
+	svc.loopbackListener = baseListener
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := baseListener.Accept()
+		if err != nil {
+			accepted <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		remoteAddr, err := readLoopbackPreface(conn)
+		if err != nil {
+			accepted <- err
+			return
+		}
+		if remoteAddr != "192.0.2.51:443" {
+			accepted <- fmt.Errorf("remoteAddr = %q, want %q", remoteAddr, "192.0.2.51:443")
+			return
+		}
+		accepted <- nil
+	}()
+
+	conn, err := svc.openLoopbackConn("192.0.2.51:443")
+	if err != nil {
+		t.Fatalf("openLoopbackConn() error = %v", err)
+	}
+	_ = conn.Close()
+
+	select {
+	case err := <-accepted:
+		if err != nil {
+			t.Fatalf("accepted loopback conn error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for loopback accept")
+	}
+}
+
 func TestConnectLoopStopsWhenReplaced(t *testing.T) {
 	t.Parallel()
 
@@ -320,6 +398,157 @@ func TestConnectLoopStopsWhenReplaced(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("connectLoop() did not stop for replaced session")
+	}
+}
+
+func TestConnectOnceRegistrationRejected(t *testing.T) {
+	t.Parallel()
+
+	serverConn, clientConn := net.Pipe()
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- serveTestControlSession(serverConn, "edge.example.test", func(session *yamux.Session) error {
+			stream, err := session.AcceptStream()
+			if err != nil {
+				return fmt.Errorf("AcceptStream() error = %w", err)
+			}
+			defer func() { _ = stream.Close() }()
+
+			env, err := control.ReadEnvelope(stream)
+			if err != nil {
+				return fmt.Errorf("ReadEnvelope() error = %w", err)
+			}
+			req := env.GetRegisterRequest()
+			if req == nil {
+				return fmt.Errorf("register request = nil")
+			}
+			if req.Token != "demo-token" {
+				return fmt.Errorf("token = %q, want %q", req.Token, "demo-token")
+			}
+
+			return control.WriteEnvelope(stream, &controlpb.Envelope{
+				Message: &controlpb.Envelope_RegisterResponse{
+					RegisterResponse: &controlpb.RegisterResponse{
+						Accepted: false,
+						Message:  "nope",
+					},
+				},
+			})
+		})
+	}()
+
+	svc := &Service{
+		cfg: config.ClientConfig{
+			EdgeAddr: "edge.example.test:443",
+			Token:    "demo-token",
+			Routes:   map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
+		},
+		logger:           slogDiscard(),
+		dialContext:      singleUseDialer(t, clientConn),
+		controlTLSConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	err := svc.connectOnce(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "registration rejected: nope") {
+		t.Fatalf("connectOnce() error = %v, want registration rejected", err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("test control server error = %v", err)
+	}
+}
+
+func TestConnectOnceReturnsOnContextCancellationAfterRegistration(t *testing.T) {
+	t.Parallel()
+
+	serverConn, clientConn := net.Pipe()
+	registered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() {
+			close(release)
+		})
+	})
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- serveTestControlSession(serverConn, "edge.example.test", func(session *yamux.Session) error {
+			stream, err := session.AcceptStream()
+			if err != nil {
+				return fmt.Errorf("AcceptStream() error = %w", err)
+			}
+			defer func() { _ = stream.Close() }()
+
+			env, err := control.ReadEnvelope(stream)
+			if err != nil {
+				return fmt.Errorf("ReadEnvelope() error = %w", err)
+			}
+			req := env.GetRegisterRequest()
+			if req == nil {
+				return fmt.Errorf("register request = nil")
+			}
+			if req.Token != "demo-token" {
+				return fmt.Errorf("token = %q, want %q", req.Token, "demo-token")
+			}
+			if err := control.WriteEnvelope(stream, &controlpb.Envelope{
+				Message: &controlpb.Envelope_RegisterResponse{
+					RegisterResponse: &controlpb.RegisterResponse{
+						Accepted:               true,
+						HeartbeatIntervalNanos: int64(time.Hour),
+						HeartbeatTimeoutNanos:  int64(time.Hour),
+					},
+				},
+			}); err != nil {
+				return err
+			}
+
+			close(registered)
+			<-release
+			return nil
+		})
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	svc := &Service{
+		cfg: config.ClientConfig{
+			EdgeAddr: "edge.example.test:443",
+			Token:    "demo-token",
+			Routes:   map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
+		},
+		logger:           slogDiscard(),
+		dialContext:      singleUseDialer(t, clientConn),
+		controlTLSConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	errs := make(chan error, 1)
+	go func() {
+		errs <- svc.connectOnce(ctx)
+	}()
+
+	select {
+	case <-registered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for register response")
+	}
+
+	cancel()
+
+	select {
+	case err := <-errs:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("connectOnce() error = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connectOnce() did not return after cancellation")
+	}
+
+	releaseOnce.Do(func() {
+		close(release)
+	})
+	if err := <-serverDone; err != nil {
+		t.Fatalf("test control server error = %v", err)
 	}
 }
 
@@ -793,4 +1022,67 @@ type failingWriter struct {
 
 func (w failingWriter) Write([]byte) (int, error) {
 	return 0, w.err
+}
+
+func singleUseDialer(t *testing.T, conn net.Conn) func(context.Context, string, string) (net.Conn, error) {
+	t.Helper()
+
+	var used atomic.Bool
+	return func(context.Context, string, string) (net.Conn, error) {
+		if !used.CompareAndSwap(false, true) {
+			t.Fatal("dialer called more than once")
+		}
+		return conn, nil
+	}
+}
+
+func serveTestControlSession(conn net.Conn, serverName string, handler func(*yamux.Session) error) error {
+	defer func() { _ = conn.Close() }()
+
+	tlsConn := tls.Server(conn, &tls.Config{
+		Certificates: []tls.Certificate{testTLSCertificate(serverName)},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{control.ALPNControl},
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		return fmt.Errorf("Handshake() error = %w", err)
+	}
+
+	session, err := yamux.Server(tlsConn, (&Service{}).yamuxConfig())
+	if err != nil {
+		return fmt.Errorf("yamux.Server() error = %w", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	err = handler(session)
+	if errors.Is(err, yamux.ErrSessionShutdown) {
+		return nil
+	}
+	return err
+}
+
+func testTLSCertificate(serverName string) tls.Certificate {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(fmt.Sprintf("GenerateKey() error: %v", err))
+	}
+
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		DNSNames:              []string{serverName},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		panic(fmt.Sprintf("CreateCertificate() error: %v", err))
+	}
+
+	return tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  privateKey,
+	}
 }
