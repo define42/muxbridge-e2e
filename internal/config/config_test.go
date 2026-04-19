@@ -100,6 +100,12 @@ client_credentials:
 	if cfg.Debug {
 		t.Fatal("Debug = true, want false by default")
 	}
+	if cfg.MaxInflightPerSession != defaultMaxInflightPerSession {
+		t.Fatalf("MaxInflightPerSession = %d, want %d", cfg.MaxInflightPerSession, defaultMaxInflightPerSession)
+	}
+	if cfg.MaxTotalInflight != defaultMaxTotalInflight {
+		t.Fatalf("MaxTotalInflight = %d, want %d", cfg.MaxTotalInflight, defaultMaxTotalInflight)
+	}
 }
 
 func TestLoadEdgeConfigParsesDebug(t *testing.T) {
@@ -121,6 +127,57 @@ client_credentials:
 	}
 	if !cfg.Debug {
 		t.Fatal("Debug = false, want true")
+	}
+}
+
+func TestLoadEdgeConfigParsesInflightLimits(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                   string
+		extra                  string
+		wantPerSessionInflight int
+		wantTotalInflight      int
+	}{
+		{
+			name:                   "explicit zero disables both",
+			extra:                  "max_inflight_per_session: 0\nmax_total_inflight: 0\n",
+			wantPerSessionInflight: 0,
+			wantTotalInflight:      0,
+		},
+		{
+			name:                   "explicit values",
+			extra:                  "max_inflight_per_session: 64\nmax_total_inflight: 256\n",
+			wantPerSessionInflight: 64,
+			wantTotalInflight:      256,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := writeTempYAML(t, `
+public_domain: example.test
+edge_domain: edge.example.test
+data_dir: /tmp/edge
+`+tt.extra+`client_credentials:
+  demo-token:
+    - demo.example.test
+`)
+
+			cfg, err := LoadEdgeConfig(path)
+			if err != nil {
+				t.Fatalf("LoadEdgeConfig() error = %v", err)
+			}
+			if cfg.MaxInflightPerSession != tt.wantPerSessionInflight {
+				t.Fatalf("MaxInflightPerSession = %d, want %d", cfg.MaxInflightPerSession, tt.wantPerSessionInflight)
+			}
+			if cfg.MaxTotalInflight != tt.wantTotalInflight {
+				t.Fatalf("MaxTotalInflight = %d, want %d", cfg.MaxTotalInflight, tt.wantTotalInflight)
+			}
+		})
 	}
 }
 
@@ -247,6 +304,32 @@ func TestEdgeConfigValidate(t *testing.T) {
 				ClientCredentials: map[string][]string{"demo-token": {"demo.example.test"}},
 			},
 			wantErr: "tls_cert_file and tls_key_file must be provided together",
+		},
+		{
+			name: "negative per-session inflight limit",
+			cfg: EdgeConfig{
+				PublicDomain:          "example.test",
+				EdgeDomain:            "edge.example.test",
+				ListenHTTPS:           ":443",
+				ListenHTTP:            ":80",
+				DataDir:               "/tmp/edge",
+				MaxInflightPerSession: -1,
+				ClientCredentials:     map[string][]string{"demo-token": {"demo.example.test"}},
+			},
+			wantErr: "max_inflight_per_session must be greater than or equal to zero",
+		},
+		{
+			name: "negative total inflight limit",
+			cfg: EdgeConfig{
+				PublicDomain:      "example.test",
+				EdgeDomain:        "edge.example.test",
+				ListenHTTPS:       ":443",
+				ListenHTTP:        ":80",
+				DataDir:           "/tmp/edge",
+				MaxTotalInflight:  -1,
+				ClientCredentials: map[string][]string{"demo-token": {"demo.example.test"}},
+			},
+			wantErr: "max_total_inflight must be greater than or equal to zero",
 		},
 		{
 			name: "empty token",

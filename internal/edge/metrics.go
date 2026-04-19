@@ -5,6 +5,7 @@ import "github.com/prometheus/client_golang/prometheus"
 type Metrics struct {
 	ActiveSessions         prometheus.Gauge
 	RegisteredHostnames    prometheus.Gauge
+	InflightStreams        prometheus.Gauge
 	HeartbeatsMissed       prometheus.Counter
 	StreamsOpened          prometheus.Counter
 	StreamsClosed          prometheus.Counter
@@ -12,6 +13,8 @@ type Metrics struct {
 	UnknownHostCloses      prometheus.Counter
 	MissingSNICloses       prometheus.Counter
 	ClientHelloParseErrors prometheus.Counter
+	PerSessionLimitRejects prometheus.Counter
+	TotalLimitRejects      prometheus.Counter
 }
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -26,6 +29,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		RegisteredHostnames: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "muxbridge_edge_registered_hostnames",
 			Help: "Number of hostnames mapped to active sessions.",
+		}),
+		InflightStreams: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "muxbridge_edge_inflight_streams",
+			Help: "Number of currently active tunneled public connections/yamux data streams.",
 		}),
 		HeartbeatsMissed: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "muxbridge_edge_heartbeats_missed_total",
@@ -55,10 +62,19 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "muxbridge_edge_clienthello_parse_errors_total",
 			Help: "Connections closed because the TLS ClientHello could not be parsed.",
 		}),
+		PerSessionLimitRejects: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "muxbridge_edge_inflight_per_session_rejects_total",
+			Help: "Connections rejected because a client session hit its inflight stream limit.",
+		}),
+		TotalLimitRejects: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "muxbridge_edge_inflight_total_rejects_total",
+			Help: "Connections rejected because the edge hit its total inflight stream limit.",
+		}),
 	}
 	reg.MustRegister(
 		m.ActiveSessions,
 		m.RegisteredHostnames,
+		m.InflightStreams,
 		m.HeartbeatsMissed,
 		m.StreamsOpened,
 		m.StreamsClosed,
@@ -66,6 +82,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.UnknownHostCloses,
 		m.MissingSNICloses,
 		m.ClientHelloParseErrors,
+		m.PerSessionLimitRejects,
+		m.TotalLimitRejects,
 	)
 	return m
 }

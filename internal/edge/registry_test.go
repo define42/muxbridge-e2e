@@ -19,7 +19,7 @@ import (
 func TestSessionRegistryActivateLookupRemoveAndSnapshot(t *testing.T) {
 	t.Parallel()
 
-	registry := newSessionRegistry(NewMetrics(prometheus.NewRegistry()))
+	registry := newSessionRegistry(NewMetrics(prometheus.NewRegistry()), 0, 0)
 	first := &clientSession{
 		token:     "demo-token",
 		hostnames: []string{"demo.example.test"},
@@ -97,7 +97,7 @@ func TestSessionRegistryActivateLookupRemoveAndSnapshot(t *testing.T) {
 func TestClientSessionOpenStreamBeginDrainAndFinishStream(t *testing.T) {
 	t.Parallel()
 
-	registry := newSessionRegistry(nil)
+	registry := newSessionRegistry(NewMetrics(prometheus.NewRegistry()), 0, 0)
 	peer, sessionMux := newYamuxPair(t)
 	controlStream := &bufferCloser{}
 	session := &clientSession{
@@ -133,6 +133,12 @@ func TestClientSessionOpenStreamBeginDrainAndFinishStream(t *testing.T) {
 	if got := session.activeStreams.Load(); got != 1 {
 		t.Fatalf("activeStreams = %d, want %d", got, 1)
 	}
+	if got := registry.inflightTotal.Load(); got != 1 {
+		t.Fatalf("inflightTotal = %d, want %d", got, 1)
+	}
+	if got := gaugeValue(t, registry.metrics.InflightStreams); got != 1 {
+		t.Fatalf("InflightStreams gauge = %v, want %d", got, 1)
+	}
 
 	session.BeginDrain(controlpb.DrainReason_DRAIN_REASON_SESSION_REPLACED, "newer session", time.Second)
 	if !session.draining.Load() {
@@ -145,6 +151,12 @@ func TestClientSessionOpenStreamBeginDrainAndFinishStream(t *testing.T) {
 		t.Fatalf("OpenStream() during drain error = %v, want %v", err, errSessionDraining)
 	}
 	session.FinishStream()
+	if got := registry.inflightTotal.Load(); got != 0 {
+		t.Fatalf("inflightTotal after FinishStream = %d, want %d", got, 0)
+	}
+	if got := gaugeValue(t, registry.metrics.InflightStreams); got != 0 {
+		t.Fatalf("InflightStreams gauge after FinishStream = %v, want %d", got, 0)
+	}
 
 	select {
 	case <-session.closed:
@@ -169,7 +181,7 @@ func TestClientSessionOpenStreamBeginDrainAndFinishStream(t *testing.T) {
 func TestSessionRegistryShutdownBeginsDrain(t *testing.T) {
 	t.Parallel()
 
-	registry := newSessionRegistry(nil)
+	registry := newSessionRegistry(nil, 0, 0)
 
 	sessionOne := newDrainableSession(t, registry, "demo-token", "demo.example.test")
 	sessionTwo := newDrainableSession(t, registry, "api-token", "api.example.test")
@@ -191,6 +203,115 @@ func TestSessionRegistryShutdownBeginsDrain(t *testing.T) {
 	}
 	if envOne.GetDrainNotice().GetReason() != controlpb.DrainReason_DRAIN_REASON_SERVER_SHUTDOWN {
 		t.Fatalf("sessionOne drain reason = %v, want server shutdown", envOne.GetDrainNotice().GetReason())
+	}
+}
+
+func TestClientSessionOpenStreamRejectsPerSessionInflightLimit(t *testing.T) {
+	t.Parallel()
+
+	registry := newSessionRegistry(NewMetrics(prometheus.NewRegistry()), 1, 0)
+	peer, sessionMux := newYamuxPair(t)
+	controlStream := &bufferCloser{}
+	session := &clientSession{
+		id:            "session-limit",
+		token:         "demo-token",
+		hostnames:     []string{"demo.example.test"},
+		mux:           sessionMux,
+		controlStream: controlStream,
+		controlWriter: control.NewLockedWriter(controlStream),
+		registry:      registry,
+		closed:        make(chan struct{}),
+	}
+	if _, err := registry.activate(session); err != nil {
+		t.Fatalf("activate() error = %v", err)
+	}
+
+	accepted := make(chan *yamux.Stream, 1)
+	go func() {
+		stream, err := peer.AcceptStream()
+		if err == nil {
+			accepted <- stream
+		}
+	}()
+
+	stream, err := session.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream(first) error = %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	defer session.FinishStream()
+
+	peerStream := <-accepted
+	defer func() { _ = peerStream.Close() }()
+
+	if _, err := session.OpenStream(); !errors.Is(err, errSessionInflightLimitReached) {
+		t.Fatalf("OpenStream(second) error = %v, want %v", err, errSessionInflightLimitReached)
+	}
+	if got := session.activeStreams.Load(); got != 1 {
+		t.Fatalf("activeStreams = %d, want %d", got, 1)
+	}
+	if got := registry.inflightTotal.Load(); got != 1 {
+		t.Fatalf("inflightTotal = %d, want %d", got, 1)
+	}
+}
+
+func TestClientSessionOpenStreamRejectsTotalInflightLimitAcrossSessions(t *testing.T) {
+	t.Parallel()
+
+	registry := newSessionRegistry(NewMetrics(prometheus.NewRegistry()), 0, 1)
+	sessionOne := newDrainableSession(t, registry, "demo-token", "demo.example.test")
+	sessionTwo := newDrainableSession(t, registry, "api-token", "api.example.test")
+	if _, err := registry.activate(sessionOne); err != nil {
+		t.Fatalf("activate(sessionOne) error = %v", err)
+	}
+	if _, err := registry.activate(sessionTwo); err != nil {
+		t.Fatalf("activate(sessionTwo) error = %v", err)
+	}
+
+	streamOne, err := sessionOne.OpenStream()
+	if err != nil {
+		t.Fatalf("sessionOne.OpenStream() error = %v", err)
+	}
+	defer func() { _ = streamOne.Close() }()
+	defer sessionOne.FinishStream()
+
+	if _, err := sessionTwo.OpenStream(); !errors.Is(err, errTotalInflightLimitReached) {
+		t.Fatalf("sessionTwo.OpenStream() error = %v, want %v", err, errTotalInflightLimitReached)
+	}
+	if got := registry.inflightTotal.Load(); got != 1 {
+		t.Fatalf("inflightTotal = %d, want %d", got, 1)
+	}
+}
+
+func TestClientSessionOpenStreamRollsBackReservationsWhenMuxOpenFails(t *testing.T) {
+	t.Parallel()
+
+	registry := newSessionRegistry(NewMetrics(prometheus.NewRegistry()), 1, 1)
+	_, sessionMux := newYamuxPair(t)
+	_ = sessionMux.Close()
+	controlStream := &bufferCloser{}
+	session := &clientSession{
+		id:            "session-rollback",
+		token:         "demo-token",
+		hostnames:     []string{"demo.example.test"},
+		mux:           sessionMux,
+		controlStream: controlStream,
+		controlWriter: control.NewLockedWriter(controlStream),
+		registry:      registry,
+		closed:        make(chan struct{}),
+	}
+
+	if _, err := session.OpenStream(); err == nil {
+		t.Fatal("OpenStream() error = nil, want mux open failure")
+	}
+	if got := session.activeStreams.Load(); got != 0 {
+		t.Fatalf("activeStreams = %d, want %d", got, 0)
+	}
+	if got := registry.inflightTotal.Load(); got != 0 {
+		t.Fatalf("inflightTotal = %d, want %d", got, 0)
+	}
+	if got := gaugeValue(t, registry.metrics.InflightStreams); got != 0 {
+		t.Fatalf("InflightStreams gauge = %v, want %d", got, 0)
 	}
 }
 

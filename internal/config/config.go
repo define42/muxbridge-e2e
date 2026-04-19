@@ -11,12 +11,14 @@ import (
 )
 
 const (
-	defaultHandshakeTimeout  = 5 * time.Second
-	defaultHeartbeatInterval = 15 * time.Second
-	defaultHeartbeatTimeout  = 45 * time.Second
-	defaultReplaceGrace      = 30 * time.Second
-	defaultReconnectMin      = 1 * time.Second
-	defaultReconnectMax      = 30 * time.Second
+	defaultHandshakeTimeout      = 5 * time.Second
+	defaultHeartbeatInterval     = 15 * time.Second
+	defaultHeartbeatTimeout      = 45 * time.Second
+	defaultReplaceGrace          = 30 * time.Second
+	defaultMaxInflightPerSession = 128
+	defaultMaxTotalInflight      = 512
+	defaultReconnectMin          = 1 * time.Second
+	defaultReconnectMax          = 30 * time.Second
 )
 
 type Duration struct {
@@ -40,20 +42,41 @@ func (d Duration) MarshalYAML() (any, error) {
 }
 
 type EdgeConfig struct {
-	PublicDomain       string              `yaml:"public_domain"`
-	EdgeDomain         string              `yaml:"edge_domain"`
-	ListenHTTPS        string              `yaml:"listen_https"`
-	ListenHTTP         string              `yaml:"listen_http"`
-	DataDir            string              `yaml:"data_dir"`
-	AcmeEmail          string              `yaml:"acme_email"`
-	TLSCertFile        string              `yaml:"tls_cert_file"`
-	TLSKeyFile         string              `yaml:"tls_key_file"`
-	Debug              bool                `yaml:"debug"`
-	ClientCredentials  map[string][]string `yaml:"client_credentials"`
-	HandshakeTimeout   Duration            `yaml:"handshake_timeout"`
-	HeartbeatInterval  Duration            `yaml:"heartbeat_interval"`
-	HeartbeatTimeout   Duration            `yaml:"heartbeat_timeout"`
-	ReplaceGracePeriod Duration            `yaml:"replace_grace_period"`
+	PublicDomain          string              `yaml:"public_domain"`
+	EdgeDomain            string              `yaml:"edge_domain"`
+	ListenHTTPS           string              `yaml:"listen_https"`
+	ListenHTTP            string              `yaml:"listen_http"`
+	DataDir               string              `yaml:"data_dir"`
+	AcmeEmail             string              `yaml:"acme_email"`
+	TLSCertFile           string              `yaml:"tls_cert_file"`
+	TLSKeyFile            string              `yaml:"tls_key_file"`
+	Debug                 bool                `yaml:"debug"`
+	MaxInflightPerSession int                 `yaml:"max_inflight_per_session"`
+	MaxTotalInflight      int                 `yaml:"max_total_inflight"`
+	ClientCredentials     map[string][]string `yaml:"client_credentials"`
+	HandshakeTimeout      Duration            `yaml:"handshake_timeout"`
+	HeartbeatInterval     Duration            `yaml:"heartbeat_interval"`
+	HeartbeatTimeout      Duration            `yaml:"heartbeat_timeout"`
+	ReplaceGracePeriod    Duration            `yaml:"replace_grace_period"`
+}
+
+type edgeConfigYAML struct {
+	PublicDomain          string              `yaml:"public_domain"`
+	EdgeDomain            string              `yaml:"edge_domain"`
+	ListenHTTPS           string              `yaml:"listen_https"`
+	ListenHTTP            string              `yaml:"listen_http"`
+	DataDir               string              `yaml:"data_dir"`
+	AcmeEmail             string              `yaml:"acme_email"`
+	TLSCertFile           string              `yaml:"tls_cert_file"`
+	TLSKeyFile            string              `yaml:"tls_key_file"`
+	Debug                 bool                `yaml:"debug"`
+	MaxInflightPerSession *int                `yaml:"max_inflight_per_session"`
+	MaxTotalInflight      *int                `yaml:"max_total_inflight"`
+	ClientCredentials     map[string][]string `yaml:"client_credentials"`
+	HandshakeTimeout      Duration            `yaml:"handshake_timeout"`
+	HeartbeatInterval     Duration            `yaml:"heartbeat_interval"`
+	HeartbeatTimeout      Duration            `yaml:"heartbeat_timeout"`
+	ReplaceGracePeriod    Duration            `yaml:"replace_grace_period"`
 }
 
 type ClientConfig struct {
@@ -90,7 +113,48 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 	return cfg, nil
 }
 
+func (c *EdgeConfig) UnmarshalYAML(value *yaml.Node) error {
+	var raw edgeConfigYAML
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+
+	maxInflightPerSession := defaultMaxInflightPerSession
+	if raw.MaxInflightPerSession != nil {
+		maxInflightPerSession = *raw.MaxInflightPerSession
+	}
+	maxTotalInflight := defaultMaxTotalInflight
+	if raw.MaxTotalInflight != nil {
+		maxTotalInflight = *raw.MaxTotalInflight
+	}
+
+	*c = EdgeConfig{
+		PublicDomain:          raw.PublicDomain,
+		EdgeDomain:            raw.EdgeDomain,
+		ListenHTTPS:           raw.ListenHTTPS,
+		ListenHTTP:            raw.ListenHTTP,
+		DataDir:               raw.DataDir,
+		AcmeEmail:             raw.AcmeEmail,
+		TLSCertFile:           raw.TLSCertFile,
+		TLSKeyFile:            raw.TLSKeyFile,
+		Debug:                 raw.Debug,
+		MaxInflightPerSession: maxInflightPerSession,
+		MaxTotalInflight:      maxTotalInflight,
+		ClientCredentials:     raw.ClientCredentials,
+		HandshakeTimeout:      raw.HandshakeTimeout,
+		HeartbeatInterval:     raw.HeartbeatInterval,
+		HeartbeatTimeout:      raw.HeartbeatTimeout,
+		ReplaceGracePeriod:    raw.ReplaceGracePeriod,
+	}
+	return nil
+}
+
 func (c *EdgeConfig) applyDefaults() {
+	c.ApplyDefaults()
+}
+
+// ApplyDefaults fills zero-valued listener and timing fields with their defaults.
+func (c *EdgeConfig) ApplyDefaults() {
 	if c.ListenHTTPS == "" {
 		c.ListenHTTPS = ":443"
 	}
@@ -146,6 +210,12 @@ func (c EdgeConfig) Validate() error {
 	}
 	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
 		return errors.New("tls_cert_file and tls_key_file must be provided together")
+	}
+	if c.MaxInflightPerSession < 0 {
+		return errors.New("max_inflight_per_session must be greater than or equal to zero")
+	}
+	if c.MaxTotalInflight < 0 {
+		return errors.New("max_total_inflight must be greater than or equal to zero")
 	}
 	seenHosts := make(map[string]string)
 	for token, hosts := range c.ClientCredentials {

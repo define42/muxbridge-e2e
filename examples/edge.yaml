@@ -16,6 +16,11 @@ heartbeat_interval: "15s"
 heartbeat_timeout: "45s"
 replace_grace_period: "30s"
 
+# Optional inflight stream caps for tunneled public traffic.
+# 0 disables the corresponding cap.
+max_inflight_per_session: 128
+max_total_inflight: 512
+
 # Optional. Expose Go pprof handlers on https://edge_domain/pprof/... only when true.
 debug: false
 

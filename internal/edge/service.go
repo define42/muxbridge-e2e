@@ -63,6 +63,8 @@ type Service struct {
 }
 
 func New(cfg config.EdgeConfig, opts Options) *Service {
+	cfg.ApplyDefaults()
+
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -83,7 +85,7 @@ func New(cfg config.EdgeConfig, opts Options) *Service {
 		cfg:               cfg,
 		logger:            logger,
 		metrics:           metrics,
-		registry:          newSessionRegistry(metrics),
+		registry:          newSessionRegistry(metrics, cfg.MaxInflightPerSession, cfg.MaxTotalInflight),
 		metricsHandler:    promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{}),
 		certIssuerFactory: opts.CertIssuerFactory,
 		manageSync:        opts.ManageSynchronously,
@@ -289,8 +291,19 @@ func (s *Service) handleHTTPSConn(ctx context.Context, conn net.Conn) {
 
 	stream, err := session.OpenStream()
 	if err != nil {
-		s.logger.Warn("open yamux stream failed", "session_id", session.id, "hostname", info.ServerName, "error", err)
-		_ = replayConn.Close()
+		switch {
+		case errors.Is(err, errSessionInflightLimitReached):
+			s.metrics.PerSessionLimitRejects.Inc()
+			s.logger.Debug("rejecting tunneled connection after per-session inflight limit", "session_id", session.id, "hostname", info.ServerName)
+			rejectTunneledConn(conn)
+		case errors.Is(err, errTotalInflightLimitReached):
+			s.metrics.TotalLimitRejects.Inc()
+			s.logger.Debug("rejecting tunneled connection after total inflight limit", "session_id", session.id, "hostname", info.ServerName)
+			rejectTunneledConn(conn)
+		default:
+			s.logger.Warn("open yamux stream failed", "session_id", session.id, "hostname", info.ServerName, "error", err)
+			_ = replayConn.Close()
+		}
 		return
 	}
 	defer session.FinishStream()
@@ -684,6 +697,13 @@ func remoteIP(addr net.Addr) string {
 		return host
 	}
 	return addr.String()
+}
+
+func rejectTunneledConn(conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetLinger(0)
+	}
+	_ = conn.Close()
 }
 
 func newSessionID() string {

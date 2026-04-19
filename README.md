@@ -54,6 +54,11 @@ heartbeat_interval: "15s"
 heartbeat_timeout: "45s"
 replace_grace_period: "30s"
 
+# Optional inflight stream caps for tunneled public traffic (defaults shown).
+# 0 disables the corresponding cap.
+max_inflight_per_session: 128
+max_total_inflight: 512
+
 # Optional. Expose Go pprof handlers on https://edge_domain/pprof/... only when true.
 debug: false
 
@@ -65,6 +70,8 @@ client_credentials:
 
 A hostname may appear under only one token. A client's registered hostnames must exactly equal the hostnames listed for its token (same set, order-independent).
 When the edge manages its own certificate via CertMagic, `acme_email` becomes the ACME account contact for `edge_domain`.
+
+`max_inflight_per_session` limits how many active tunneled public connections / yamux data streams a single connected client session may hold at once. `max_total_inflight` caps the total number of active tunneled public connections / yamux data streams across the whole edge. These caps apply to tunneled TLS/TCP traffic only; the edge still does not decrypt requests, so one HTTP/2 connection counts as one active stream even if it carries many requests. When a cap is reached, the edge rejects the new public connection before opening a tunnel stream, using a best-effort TCP reset or plain close rather than returning HTTP `503`.
 
 ### Profiling
 

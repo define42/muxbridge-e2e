@@ -29,6 +29,8 @@ type clientSession struct {
 }
 
 var errSessionDraining = errors.New("session draining")
+var errSessionInflightLimitReached = errors.New("session inflight limit reached")
+var errTotalInflightLimitReached = errors.New("total inflight limit reached")
 
 type ioCloser interface {
 	Close() error
@@ -45,16 +47,25 @@ func (s *clientSession) OpenStream() (*yamux.Stream, error) {
 	if s.draining.Load() {
 		return nil, errSessionDraining
 	}
-
-	stream, err := s.mux.OpenStream()
-	if err != nil {
+	if limit := s.registry.maxInflightPerSession; limit > 0 && s.activeStreams.Load() >= int64(limit) {
+		return nil, errSessionInflightLimitReached
+	}
+	if err := s.registry.reserveInflight(); err != nil {
 		return nil, err
 	}
 	s.activeStreams.Add(1)
+
+	stream, err := s.mux.OpenStream()
+	if err != nil {
+		s.activeStreams.Add(-1)
+		s.registry.releaseInflight()
+		return nil, err
+	}
 	return stream, nil
 }
 
 func (s *clientSession) FinishStream() {
+	s.registry.releaseInflight()
 	if remaining := s.activeStreams.Add(-1); remaining == 0 && s.draining.Load() {
 		s.Close()
 	}
@@ -103,17 +114,22 @@ func (s *clientSession) Close() {
 }
 
 type sessionRegistry struct {
-	mu      sync.RWMutex
-	byHost  map[string]*clientSession
-	byToken map[string]*clientSession
-	metrics *Metrics
+	mu                    sync.RWMutex
+	byHost                map[string]*clientSession
+	byToken               map[string]*clientSession
+	metrics               *Metrics
+	maxInflightPerSession int
+	maxTotalInflight      int
+	inflightTotal         atomic.Int64
 }
 
-func newSessionRegistry(metrics *Metrics) *sessionRegistry {
+func newSessionRegistry(metrics *Metrics, maxInflightPerSession, maxTotalInflight int) *sessionRegistry {
 	return &sessionRegistry{
-		byHost:  make(map[string]*clientSession),
-		byToken: make(map[string]*clientSession),
-		metrics: metrics,
+		byHost:                make(map[string]*clientSession),
+		byToken:               make(map[string]*clientSession),
+		metrics:               metrics,
+		maxInflightPerSession: maxInflightPerSession,
+		maxTotalInflight:      maxTotalInflight,
 	}
 }
 
@@ -192,6 +208,41 @@ func (r *sessionRegistry) updateMetricsLocked() {
 	}
 	r.metrics.ActiveSessions.Set(float64(len(r.byToken)))
 	r.metrics.RegisteredHostnames.Set(float64(len(r.byHost)))
+}
+
+func (r *sessionRegistry) reserveInflight() error {
+	if r.maxTotalInflight <= 0 {
+		total := r.inflightTotal.Add(1)
+		r.setInflightMetric(total)
+		return nil
+	}
+
+	for {
+		current := r.inflightTotal.Load()
+		if current >= int64(r.maxTotalInflight) {
+			return errTotalInflightLimitReached
+		}
+		if r.inflightTotal.CompareAndSwap(current, current+1) {
+			r.setInflightMetric(current + 1)
+			return nil
+		}
+	}
+}
+
+func (r *sessionRegistry) releaseInflight() {
+	total := r.inflightTotal.Add(-1)
+	if total < 0 {
+		total = 0
+		r.inflightTotal.Store(0)
+	}
+	r.setInflightMetric(total)
+}
+
+func (r *sessionRegistry) setInflightMetric(total int64) {
+	if r.metrics == nil {
+		return
+	}
+	r.metrics.InflightStreams.Set(float64(total))
 }
 
 type registrySnapshot struct {

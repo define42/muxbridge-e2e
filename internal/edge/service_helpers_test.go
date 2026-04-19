@@ -2,6 +2,7 @@ package edge
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"net"
@@ -57,7 +58,9 @@ func TestEdgeHTTPHandlerAndPublicHTTPHandler(t *testing.T) {
 	t.Parallel()
 
 	service := New(config.EdgeConfig{
-		EdgeDomain: "edge.example.test",
+		EdgeDomain:            "edge.example.test",
+		MaxInflightPerSession: 1,
+		MaxTotalInflight:      1,
 	}, Options{Registerer: prometheus.NewRegistry()})
 	service.httpsListener = stubListener{addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8443}}
 	service.httpListener = stubListener{addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}}
@@ -486,6 +489,179 @@ func TestHandleControlConnRegistersSession(t *testing.T) {
 	waitClosed(t, done)
 }
 
+func TestHandleHTTPSConnRejectsPerSessionInflightLimit(t *testing.T) {
+	t.Parallel()
+
+	service := New(config.EdgeConfig{
+		EdgeDomain:            "edge.example.test",
+		MaxInflightPerSession: 1,
+		ClientCredentials: map[string][]string{
+			"demo-token": {"demo.example.test"},
+		},
+	}, Options{Registerer: prometheus.NewRegistry()})
+
+	session, peer := newActiveServiceSession(t, service, "demo-token", "demo.example.test")
+	accepted := make(chan *yamux.Stream, 1)
+	go func() {
+		stream, err := peer.AcceptStream()
+		if err == nil {
+			accepted <- stream
+		}
+	}()
+
+	firstStream, err := session.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	defer func() { _ = firstStream.Close() }()
+
+	peerStream := <-accepted
+	defer func() { _ = peerStream.Close() }()
+
+	if got := gaugeValue(t, service.metrics.InflightStreams); got != 1 {
+		t.Fatalf("InflightStreams gauge = %v, want %d", got, 1)
+	}
+
+	done := make(chan struct{})
+	serverConn, clientConn := net.Pipe()
+	go func() {
+		service.handleHTTPSConn(context.Background(), serverConn)
+		close(done)
+	}()
+
+	tlsErrCh := make(chan error, 1)
+	go func() {
+		tlsConn := tls.Client(clientConn, &tls.Config{
+			ServerName:         "demo.example.test",
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2"},
+		})
+		tlsErrCh <- tlsConn.Handshake()
+		_ = tlsConn.Close()
+	}()
+
+	waitClosed(t, done)
+	select {
+	case err := <-tlsErrCh:
+		if err == nil {
+			t.Fatal("Handshake() error = nil, want rejected connection")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handshake() did not finish after per-session rejection")
+	}
+
+	select {
+	case stream := <-accepted:
+		_ = stream.Close()
+		t.Fatal("peer.AcceptStream() unexpectedly received a second stream")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if got := counterValue(t, service.metrics.PerSessionLimitRejects); got != 1 {
+		t.Fatalf("PerSessionLimitRejects = %v, want %d", got, 1)
+	}
+	if got := counterValue(t, service.metrics.TotalLimitRejects); got != 0 {
+		t.Fatalf("TotalLimitRejects = %v, want %d", got, 0)
+	}
+	if got := gaugeValue(t, service.metrics.InflightStreams); got != 1 {
+		t.Fatalf("InflightStreams gauge after rejection = %v, want %d", got, 1)
+	}
+
+	session.FinishStream()
+	if got := gaugeValue(t, service.metrics.InflightStreams); got != 0 {
+		t.Fatalf("InflightStreams gauge after release = %v, want %d", got, 0)
+	}
+}
+
+func TestHandleHTTPSConnRejectsTotalInflightLimit(t *testing.T) {
+	t.Parallel()
+
+	service := New(config.EdgeConfig{
+		EdgeDomain:       "edge.example.test",
+		MaxTotalInflight: 1,
+		ClientCredentials: map[string][]string{
+			"demo-token": {"demo.example.test"},
+			"api-token":  {"api.example.test"},
+		},
+	}, Options{Registerer: prometheus.NewRegistry()})
+
+	sessionOne, peerOne := newActiveServiceSession(t, service, "demo-token", "demo.example.test")
+	_, peerTwo := newActiveServiceSession(t, service, "api-token", "api.example.test")
+	acceptedOne := make(chan *yamux.Stream, 1)
+	go func() {
+		stream, err := peerOne.AcceptStream()
+		if err == nil {
+			acceptedOne <- stream
+		}
+	}()
+
+	firstStream, err := sessionOne.OpenStream()
+	if err != nil {
+		t.Fatalf("sessionOne.OpenStream() error = %v", err)
+	}
+	defer func() { _ = firstStream.Close() }()
+
+	peerStreamOne := <-acceptedOne
+	defer func() { _ = peerStreamOne.Close() }()
+
+	done := make(chan struct{})
+	serverConn, clientConn := net.Pipe()
+	go func() {
+		service.handleHTTPSConn(context.Background(), serverConn)
+		close(done)
+	}()
+
+	tlsErrCh := make(chan error, 1)
+	go func() {
+		tlsConn := tls.Client(clientConn, &tls.Config{
+			ServerName:         "api.example.test",
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2"},
+		})
+		tlsErrCh <- tlsConn.Handshake()
+		_ = tlsConn.Close()
+	}()
+
+	waitClosed(t, done)
+	select {
+	case err := <-tlsErrCh:
+		if err == nil {
+			t.Fatal("Handshake() error = nil, want rejected connection")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handshake() did not finish after total limit rejection")
+	}
+
+	acceptedTwo := make(chan *yamux.Stream, 1)
+	go func() {
+		stream, err := peerTwo.AcceptStream()
+		if err == nil {
+			acceptedTwo <- stream
+		}
+	}()
+	select {
+	case stream := <-acceptedTwo:
+		_ = stream.Close()
+		t.Fatal("peerTwo.AcceptStream() unexpectedly received a stream")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if got := counterValue(t, service.metrics.PerSessionLimitRejects); got != 0 {
+		t.Fatalf("PerSessionLimitRejects = %v, want %d", got, 0)
+	}
+	if got := counterValue(t, service.metrics.TotalLimitRejects); got != 1 {
+		t.Fatalf("TotalLimitRejects = %v, want %d", got, 1)
+	}
+	if got := gaugeValue(t, service.metrics.InflightStreams); got != 1 {
+		t.Fatalf("InflightStreams gauge = %v, want %d", got, 1)
+	}
+
+	sessionOne.FinishStream()
+	if got := gaugeValue(t, service.metrics.InflightStreams); got != 0 {
+		t.Fatalf("InflightStreams gauge after release = %v, want %d", got, 0)
+	}
+}
+
 func TestHelpers(t *testing.T) {
 	t.Parallel()
 
@@ -519,9 +695,38 @@ func TestHelpers(t *testing.T) {
 	if got := remoteIP(nil); got != "" {
 		t.Fatalf("remoteIP(nil) = %q, want empty string", got)
 	}
+	serverConn, clientConn := net.Pipe()
+	rejectTunneledConn(serverConn)
+	var buf [1]byte
+	if _, err := clientConn.Read(buf[:]); err == nil {
+		t.Fatal("clientConn.Read() error = nil, want closed connection")
+	}
+	_ = clientConn.Close()
 	if got := newSessionID(); len(got) == 0 {
 		t.Fatal("newSessionID() returned an empty string")
 	}
+}
+
+func newActiveServiceSession(t *testing.T, service *Service, token, hostname string) (*clientSession, *yamux.Session) {
+	t.Helper()
+
+	peer, muxSession := newYamuxPair(t)
+	controlStream := &bufferCloser{}
+	session := &clientSession{
+		id:            hostname,
+		token:         token,
+		hostnames:     []string{hostname},
+		mux:           muxSession,
+		controlStream: controlStream,
+		controlWriter: control.NewLockedWriter(controlStream),
+		registry:      service.registry,
+		metrics:       service.metrics,
+		closed:        make(chan struct{}),
+	}
+	if _, err := service.registry.activate(session); err != nil {
+		t.Fatalf("activate(%s) error = %v", hostname, err)
+	}
+	return session, peer
 }
 
 func TestNewCertManagerUsesCustomFactory(t *testing.T) {
