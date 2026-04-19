@@ -2,7 +2,9 @@ package tunnel
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -59,6 +61,35 @@ func TestClientRunReturnsCloseError(t *testing.T) {
 	err := client.Run(ctx)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run() error = %v, want %v", err, context.DeadlineExceeded)
+	}
+}
+
+func TestNewWithProvidedTLSConfigAllowsEmptyDataDirAtStart(t *testing.T) {
+	t.Parallel()
+
+	client, err := New(Config{
+		EdgeAddr:  "edge.example.test:443",
+		Token:     "demo-token",
+		Handler:   http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+		Hostnames: []string{"demo.example.test"},
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.svc.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
+	defer closeCancel()
+	if err := client.svc.Close(closeCtx); err != nil {
+		t.Fatalf("Close() error = %v", err)
 	}
 }
 

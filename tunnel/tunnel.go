@@ -100,6 +100,7 @@ func New(cfg Config) (*Client, error) {
 	opts := client.Options{
 		Logger:           cfg.Logger,
 		Handler:          cfg.Handler,
+		TLSConfig:        cfg.TLSConfig,
 		ControlTLSConfig: cfg.ControlTLS,
 	}
 

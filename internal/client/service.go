@@ -32,6 +32,7 @@ var errSessionReplaced = errors.New("session replaced by newer client")
 type Options struct {
 	Logger              *slog.Logger
 	DialContext         func(ctx context.Context, network, addr string) (net.Conn, error)
+	TLSConfig           *tls.Config
 	ControlTLSConfig    *tls.Config
 	CertIssuerFactory   func(*certmagic.Config) certmagic.Issuer
 	ManageSynchronously bool
@@ -78,7 +79,15 @@ func New(cfg config.ClientConfig, opts Options) (*Service, error) {
 		handler = proxyHandler
 	}
 
-	tlsConfig, certManager := buildClientTLSConfig(cfg.DataDir, cfg.AcmeEmail, opts.CertIssuerFactory)
+	var (
+		tlsConfig   *tls.Config
+		certManager *certmagic.Config
+	)
+	if opts.TLSConfig != nil {
+		tlsConfig = buildProvidedClientTLSConfig(opts.TLSConfig)
+	} else {
+		tlsConfig, certManager = buildClientTLSConfig(cfg.DataDir, cfg.AcmeEmail, opts.CertIssuerFactory)
+	}
 
 	server := &http.Server{
 		Handler: handler,
@@ -102,8 +111,10 @@ func New(cfg config.ClientConfig, opts Options) (*Service, error) {
 }
 
 func (s *Service) Start(ctx context.Context) error {
-	if err := os.MkdirAll(s.cfg.DataDir, 0o755); err != nil {
-		return fmt.Errorf("create client data dir: %w", err)
+	if s.certManager != nil {
+		if err := os.MkdirAll(s.cfg.DataDir, 0o755); err != nil {
+			return fmt.Errorf("create client data dir: %w", err)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -403,6 +414,15 @@ func (s *Service) yamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = false
 	return cfg
+}
+
+func buildProvidedClientTLSConfig(base *tls.Config) *tls.Config {
+	tlsConfig := base.Clone()
+	tlsConfig.NextProtos = uniqueStrings(append([]string{"h2", "http/1.1"}, tlsConfig.NextProtos...)...)
+	if tlsConfig.MinVersion == 0 {
+		tlsConfig.MinVersion = tls.VersionTLS12
+	}
+	return tlsConfig
 }
 
 func buildClientTLSConfig(dataDir, email string, customFactory func(*certmagic.Config) certmagic.Issuer) (*tls.Config, *certmagic.Config) {

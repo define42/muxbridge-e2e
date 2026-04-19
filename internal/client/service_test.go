@@ -119,6 +119,27 @@ func TestBuildClientTLSConfigAndHelpers(t *testing.T) {
 		t.Fatalf("NextProtos = %v, want h2/http1.1 prefix", got)
 	}
 
+	provided := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		NextProtos: []string{"custom-proto"},
+	}
+	providedTLS := buildProvidedClientTLSConfig(provided)
+	if providedTLS == provided {
+		t.Fatal("buildProvidedClientTLSConfig() reused the caller config pointer")
+	}
+	if provided.MinVersion != tls.VersionTLS13 {
+		t.Fatalf("caller MinVersion = %d, want unchanged %d", provided.MinVersion, tls.VersionTLS13)
+	}
+	if got := provided.NextProtos; len(got) != 1 || got[0] != "custom-proto" {
+		t.Fatalf("caller NextProtos = %v, want unchanged original", got)
+	}
+	if providedTLS.MinVersion != tls.VersionTLS13 {
+		t.Fatalf("providedTLS.MinVersion = %d, want %d", providedTLS.MinVersion, tls.VersionTLS13)
+	}
+	if got := providedTLS.NextProtos; len(got) != 3 || got[0] != "h2" || got[1] != "http/1.1" || got[2] != "custom-proto" {
+		t.Fatalf("providedTLS.NextProtos = %v, want defaults plus custom proto", got)
+	}
+
 	manager = newClientCertManager(t.TempDir(), "ignored@example.test", func(cm *certmagic.Config) certmagic.Issuer {
 		return certmagic.NewACMEIssuer(cm, certmagic.ACMEIssuer{Email: "custom@example.test"})
 	})
@@ -146,6 +167,84 @@ func TestBuildClientTLSConfigAndHelpers(t *testing.T) {
 	}
 	if got := newSessionID(); len(got) == 0 {
 		t.Fatal("newSessionID() returned an empty string")
+	}
+}
+
+func TestNewWithProvidedTLSConfigBypassesCertManager(t *testing.T) {
+	t.Parallel()
+
+	provided := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		NextProtos: []string{"custom-proto"},
+	}
+	svc, err := New(config.ClientConfig{
+		EdgeAddr:  "edge.example.test:443",
+		Token:     "demo-token",
+		DataDir:   "",
+		AcmeEmail: "",
+		Routes:    map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
+	}, Options{
+		TLSConfig: provided,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if svc.certManager != nil {
+		t.Fatal("New() created a cert manager even though TLSConfig was provided")
+	}
+	if svc.tlsConfig == nil {
+		t.Fatal("New() returned a nil tlsConfig")
+	}
+	if svc.tlsConfig == provided {
+		t.Fatal("New() reused the caller TLSConfig pointer")
+	}
+	if got := svc.tlsConfig.NextProtos; len(got) != 3 || got[0] != "h2" || got[1] != "http/1.1" || got[2] != "custom-proto" {
+		t.Fatalf("svc.tlsConfig.NextProtos = %v, want defaults plus custom proto", got)
+	}
+	if got := provided.NextProtos; len(got) != 1 || got[0] != "custom-proto" {
+		t.Fatalf("caller NextProtos = %v, want unchanged original", got)
+	}
+}
+
+func TestStartWithProvidedTLSConfigDoesNotRequireDataDir(t *testing.T) {
+	t.Parallel()
+
+	svc, err := New(config.ClientConfig{
+		EdgeAddr:     "edge.example.test:443",
+		Token:        "demo-token",
+		DataDir:      "",
+		AcmeEmail:    "",
+		Routes:       map[string]string{"demo.example.test": "http://127.0.0.1:8080"},
+		ReconnectMin: config.Duration{Duration: 10 * time.Millisecond},
+		ReconnectMax: config.Duration{Duration: 20 * time.Millisecond},
+	}, Options{
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("dial failed")
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+	if err := svc.Close(closeCtx); err != nil {
+		t.Fatalf("Close() error = %v", err)
 	}
 }
 
