@@ -290,7 +290,7 @@ func (s *Service) connectOnce(ctx context.Context) error {
 	go s.acceptDataStreams(ctx, session, sessionErrs)
 	go s.readControlLoop(controlStream, &lastAck, sessionErrs)
 	go s.heartbeatLoop(ctx, controlWriter, heartbeatInterval, sessionErrs)
-	go s.watchdogLoop(&lastAck, heartbeatTimeout, sessionErrs)
+	go s.watchdogLoop(ctx, &lastAck, heartbeatTimeout, sessionErrs)
 
 	select {
 	case err := <-sessionErrs:
@@ -396,16 +396,21 @@ func (s *Service) heartbeatLoop(ctx context.Context, writer *control.LockedWrite
 	}
 }
 
-func (s *Service) watchdogLoop(lastAck *atomic.Int64, timeout time.Duration, errs chan<- error) {
+func (s *Service) watchdogLoop(ctx context.Context, lastAck *atomic.Int64, timeout time.Duration, errs chan<- error) {
 	ticker := time.NewTicker(timeout / 3)
 	defer ticker.Stop()
-	for range ticker.C {
-		if time.Since(time.Unix(0, lastAck.Load())) > timeout {
-			select {
-			case errs <- fmt.Errorf("heartbeat timeout"):
-			default:
-			}
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			if time.Since(time.Unix(0, lastAck.Load())) > timeout {
+				select {
+				case errs <- fmt.Errorf("heartbeat timeout"):
+				default:
+				}
+				return
+			}
 		}
 	}
 }

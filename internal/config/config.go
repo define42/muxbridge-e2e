@@ -89,6 +89,11 @@ type ClientConfig struct {
 	Routes       map[string]string `yaml:"routes"`
 	ReconnectMin Duration          `yaml:"reconnect_min"`
 	ReconnectMax Duration          `yaml:"reconnect_max"`
+
+	// HasExternalTLS signals that TLS material is supplied programmatically
+	// (e.g. via tunnel.Config.TLSConfig) rather than issued via ACME. When true,
+	// AcmeEmail is not required by Validate.
+	HasExternalTLS bool `yaml:"-"`
 }
 
 func LoadEdgeConfig(path string) (EdgeConfig, error) {
@@ -229,11 +234,11 @@ func (c ClientConfig) Validate() error {
 	if _, err := c.Signature(); err != nil {
 		return err
 	}
-	if c.DataDir == "" {
-		return errors.New("data_dir is required")
+	if c.DataDir == "" && !c.HasExternalTLS {
+		return errors.New("data_dir is required when no tls config is provided")
 	}
-	if c.AcmeEmail == "" {
-		return errors.New("acme_email is required")
+	if c.AcmeEmail == "" && !c.HasExternalTLS {
+		return errors.New("acme_email is required when no tls config is provided")
 	}
 	if len(c.Routes) == 0 {
 		return errors.New("routes must not be empty")

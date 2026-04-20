@@ -86,11 +86,12 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	cc := config.ClientConfig{
-		EdgeAddr:     cfg.EdgeAddr,
-		SignatureHex: cfg.SignatureHex,
-		DataDir:      cfg.DataDir,
-		AcmeEmail:    cfg.AcmeEmail,
-		Routes:       routes,
+		EdgeAddr:       cfg.EdgeAddr,
+		SignatureHex:   cfg.SignatureHex,
+		DataDir:        cfg.DataDir,
+		AcmeEmail:      cfg.AcmeEmail,
+		Routes:         routes,
+		HasExternalTLS: cfg.TLSConfig != nil,
 	}
 	if cfg.ReconnectMin > 0 {
 		cc.ReconnectMin.Duration = cfg.ReconnectMin
@@ -99,6 +100,9 @@ func New(cfg Config) (*Client, error) {
 		cc.ReconnectMax.Duration = cfg.ReconnectMax
 	}
 	cc.ApplyDefaults()
+	if err := cc.Validate(); err != nil {
+		return nil, fmt.Errorf("tunnel: %w", err)
+	}
 
 	opts := client.Options{
 		Logger:           cfg.Logger,

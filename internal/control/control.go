@@ -90,11 +90,9 @@ func writeFrame(w io.Writer, msg proto.Message) error {
 	if len(payload) > maxFrameSize {
 		return fmt.Errorf("control frame too large: %d", len(payload))
 	}
-	var lengthBuf [4]byte
-	binary.BigEndian.PutUint32(lengthBuf[:], uint32(len(payload)))
-	if _, err := w.Write(lengthBuf[:]); err != nil {
-		return err
-	}
-	_, err = w.Write(payload)
+	frame := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
+	copy(frame[4:], payload)
+	_, err = w.Write(frame)
 	return err
 }

@@ -646,7 +646,7 @@ func TestHeartbeatLoopAndWatchdogLoop(t *testing.T) {
 
 	var lastAck atomic.Int64
 	lastAck.Store(time.Now().Add(-time.Second).UnixNano())
-	go (&Service{}).watchdogLoop(&lastAck, 30*time.Millisecond, errs)
+	go (&Service{}).watchdogLoop(context.Background(), &lastAck, 30*time.Millisecond, errs)
 
 	select {
 	case err := <-errs:
