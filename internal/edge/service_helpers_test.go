@@ -138,7 +138,7 @@ func TestEdgeHTTPHandlerAndPublicHTTPHandler(t *testing.T) {
 			handler:    service.publicHTTPHandler(),
 			target:     "http://demo.example.test/path?q=1",
 			host:       "demo.example.test",
-			wantStatus: http.StatusPermanentRedirect,
+			wantStatus: http.StatusMovedPermanently,
 			wantHeader: "https://demo.example.test:8443/path?q=1",
 		},
 	}

@@ -582,7 +582,7 @@ func (s *Service) publicHTTPHandler() http.Handler {
 			return
 		}
 		target := "https://" + redirectHost(req.Host, s.HTTPSAddr()) + req.URL.RequestURI()
-		http.Redirect(w, req, target, http.StatusPermanentRedirect)
+		http.Redirect(w, req, target, http.StatusMovedPermanently)
 	})
 }
 
