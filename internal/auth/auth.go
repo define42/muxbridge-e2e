@@ -8,7 +8,11 @@ import (
 	"strings"
 )
 
-const registrationPrefix = "muxbridge-e2e/register-host/v1\n"
+const (
+	registrationPrefix = "muxbridge-e2e/register-host/v1\n"
+	maxHostnameLength  = 253
+	maxHostnameLabel   = 63
+)
 
 func NormalizeHostname(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
@@ -89,6 +93,8 @@ func SignatureHex(signature []byte) string {
 }
 
 func ValidateHostname(value string) error {
+	value = NormalizeHostname(value)
+
 	switch {
 	case value == "":
 		return errors.New("hostname is required")
@@ -100,9 +106,30 @@ func ValidateHostname(value string) error {
 		return errors.New("hostname must not include a port")
 	case !strings.Contains(value, "."):
 		return errors.New("hostname must contain a dot")
-	default:
-		return nil
+	case len(value) > maxHostnameLength:
+		return fmt.Errorf("hostname must be %d bytes or fewer", maxHostnameLength)
 	}
+
+	for _, label := range strings.Split(value, ".") {
+		if label == "" {
+			return errors.New("hostname labels must not be empty")
+		}
+		if len(label) > maxHostnameLabel {
+			return fmt.Errorf("hostname label %q must be %d bytes or fewer", label, maxHostnameLabel)
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("hostname label %q must not start or end with a hyphen", label)
+		}
+		for i := 0; i < len(label); i++ {
+			ch := label[i]
+			if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
+				continue
+			}
+			return fmt.Errorf("hostname label %q contains invalid character %q", label, string(ch))
+		}
+	}
+
+	return nil
 }
 
 func parseHex(value, label string) ([]byte, error) {

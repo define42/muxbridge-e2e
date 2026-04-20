@@ -282,20 +282,20 @@ func loadConfig(args []string, getenv func(string) string) (perfConfig, error) {
 		return perfConfig{}, err
 	}
 
-	cfg.PublicHost = normalizeHostname(cfg.PublicHost)
-	cfg.PublicDomain = normalizeHostname(cfg.PublicDomain)
+	cfg.PublicHost = auth.NormalizeHostname(cfg.PublicHost)
+	cfg.PublicDomain = auth.NormalizeHostname(cfg.PublicDomain)
 	cfg.EdgeAddr = strings.TrimSpace(cfg.EdgeAddr)
 	cfg.SignatureHex = strings.TrimSpace(cfg.SignatureHex)
 	cfg.Scenario = strings.ToLower(strings.TrimSpace(cfg.Scenario))
 
-	if err := validateHostname(cfg.PublicHost); err != nil {
+	if err := auth.ValidateHostname(cfg.PublicHost); err != nil {
 		return perfConfig{}, fmt.Errorf("invalid public host: %w", err)
 	}
 	if cfg.EdgeAddr == "" {
 		if cfg.PublicDomain == "" {
 			return perfConfig{}, fmt.Errorf("public domain is required when edge addr is not provided")
 		}
-		if err := validateHostname(cfg.PublicDomain); err != nil {
+		if err := auth.ValidateHostname(cfg.PublicDomain); err != nil {
 			return perfConfig{}, fmt.Errorf("invalid public domain: %w", err)
 		}
 		cfg.EdgeAddr = "edge." + cfg.PublicDomain + ":443"
@@ -958,29 +958,4 @@ func parseBoolString(value string) bool {
 
 func getenv(key string) string {
 	return strings.TrimSpace(os.Getenv(key))
-}
-
-func normalizeHostname(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	for strings.HasSuffix(value, ".") {
-		value = strings.TrimSuffix(value, ".")
-	}
-	return value
-}
-
-func validateHostname(value string) error {
-	switch {
-	case value == "":
-		return errors.New("hostname is required")
-	case strings.Contains(value, "://"):
-		return errors.New("hostname must not include a scheme")
-	case strings.Contains(value, "/"):
-		return errors.New("hostname must not include a path")
-	case strings.Contains(value, ":"):
-		return errors.New("hostname must not include a port")
-	case !strings.Contains(value, "."):
-		return errors.New("hostname must contain a dot")
-	default:
-		return nil
-	}
 }

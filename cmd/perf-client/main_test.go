@@ -205,6 +205,11 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 			want: "invalid public host",
 		},
 		{
+			name: "wildcard public host",
+			args: []string{"--public-host", "*.example.com", "--public-domain", "example.com"},
+			want: "invalid public host",
+		},
+		{
 			name: "invalid scenario",
 			args: []string{"--public-host", "perf.example.com", "--public-domain", "example.com", "--scenario", "burst"},
 			want: "unknown scenario",

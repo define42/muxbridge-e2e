@@ -24,11 +24,24 @@ func TestValidateHostname(t *testing.T) {
 		wantErr string
 	}{
 		{name: "valid", value: "demo.example.test"},
+		{name: "valid normalized", value: " Demo.Example.Test. "},
 		{name: "empty", value: "", wantErr: "hostname is required"},
 		{name: "scheme", value: "https://demo.example.test", wantErr: "must not include a scheme"},
 		{name: "path", value: "demo.example.test/path", wantErr: "must not include a path"},
 		{name: "port", value: "demo.example.test:443", wantErr: "must not include a port"},
 		{name: "no dot", value: "localhost", wantErr: "must contain a dot"},
+		{name: "empty label", value: "foo..example.test", wantErr: "labels must not be empty"},
+		{name: "leading dot", value: ".example.test", wantErr: "labels must not be empty"},
+		{name: "wildcard", value: "*.example.test", wantErr: "contains invalid character"},
+		{name: "underscore", value: "bad_name.example.test", wantErr: "contains invalid character"},
+		{name: "leading hyphen", value: "-bad.example.test", wantErr: "must not start or end with a hyphen"},
+		{name: "trailing hyphen", value: "bad-.example.test", wantErr: "must not start or end with a hyphen"},
+		{name: "label too long", value: strings.Repeat("a", 64) + ".example.test", wantErr: "must be 63 bytes or fewer"},
+		{
+			name:    "hostname too long",
+			value:   strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 62),
+			wantErr: "hostname must be 253 bytes or fewer",
+		},
 	}
 
 	for _, tt := range tests {
